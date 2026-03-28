@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from guardrails import GuardrailStack, _noop_stack
 from memory import consolidate, extract_quirks, log_run, recall, write
+from shared_memory import get_shared_briefing, promote_if_ready, record_episode
 from openai_validator import DUAL_VALIDATE_THRESHOLD, dual_validate
 from validator import (
     DRIFT_STREAK_REQUIRED,
@@ -139,10 +140,12 @@ def run(
     visited_urls: dict[str, int] = {}
 
     briefing = recall(domain)
-    if briefing:
-        for line in briefing.splitlines():
+    shared_briefing = get_shared_briefing(domain)
+    enriched_briefing = (briefing + shared_briefing).strip()
+    if enriched_briefing:
+        for line in enriched_briefing.splitlines():
             print(f"[memory] {line}")
-        enriched_goal = f"{briefing}\n\n{goal}"
+        enriched_goal = f"{enriched_briefing}\n\n{goal}"
     else:
         print(f"[memory] No prior memory for {domain} — cold start")
         enriched_goal = goal
@@ -246,9 +249,10 @@ def run(
                     log_run(domain, goal, events, success=False, is_trial=_is_trial)
                     _llm_call_count += 1
                     consolidate(domain)
+                    _sync_quirks_to_shared(domain, quirks, run_id=None, success=False, events=events)
 
                     _llm_call_count += 1
-                    replanned_goal = compress_goal(goal, briefing or "", critique)
+                    replanned_goal = compress_goal(goal, enriched_briefing or "", critique)
                     print(f"[validator] Compressed replanned goal: {replanned_goal[:120]}...")
                     print(f"[validator] Replanning (attempt {_depth + 1}/{MAX_REPLANS})\n")
                     return run(
@@ -291,6 +295,8 @@ def run(
         _llm_call_count += 1
         print(f"[memory] ✦ Semantic profile updated for {domain}")
 
+    _sync_quirks_to_shared(domain, quirks, run_id=run_id, success=True, events=events)
+
     print(f"\n📊 Score curve: {score_curve}")
 
     spans.append(
@@ -318,6 +324,54 @@ def run(
         print("[guardrail] Output scrubbed by post_run rules")
 
     return events
+
+
+# Local confidence needed before Supabase promotion (≈2+ sightings on this machine).
+_SHARED_PROMOTE_THRESHOLD = 1.5
+
+
+def _read_local_confidence(domain: str) -> dict[str, float]:
+    """
+    Read per-quirk confidence from .groundwire_memory/<domain>.json (memory.py format).
+    Returns {} on error — never raises. Does not import memory.py to avoid coupling.
+    """
+    safe = domain.replace(":", "_").replace("/", "_")
+    path = Path(".groundwire_memory") / f"{safe}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            q["text"]: float(q.get("confidence", 1.0))
+            for q in data.get("quirks", [])
+            if isinstance(q, dict) and "text" in q
+        }
+    except Exception:
+        return {}
+
+
+def _sync_quirks_to_shared(
+    domain: str,
+    quirks: list[str],
+    run_id: str | None,
+    success: bool,
+    events: list[dict],
+) -> None:
+    """Promote high-confidence quirks via Supabase RPC; log episode. No-op if unconfigured."""
+    local_confidences = _read_local_confidence(domain)
+    for quirk in quirks:
+        local_conf = local_confidences.get(quirk, 1.0)
+        if local_conf >= _SHARED_PROMOTE_THRESHOLD:
+            promote_if_ready(
+                domain=domain,
+                quirk=quirk,
+                confidence=local_conf,
+            )
+    record_episode(
+        domain=domain,
+        run_id=run_id,
+        steps=len(events),
+        success=success,
+        quirks=quirks,
+    )
 
 
 if __name__ == "__main__":
