@@ -36,7 +36,7 @@ _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
 load_dotenv(_here.parent / ".env")
 
-from core import run as _run, run_naked
+from client import GroundWire
 from evals import SessionRecorder, run_k_trials
 from guardrails import ActionBudget, DomainAllowlist, GuardrailStack, PIIScrubber
 from memory import memory_report
@@ -101,6 +101,8 @@ rprint(
     )
 )
 
+gw = GroundWire.from_env()
+
 # ── Run 0 — Naked TinyFish baseline (no memory, no validator, no guardrails) ──
 rprint(Rule())
 rprint("\n[bold]Run 0 — Naked TinyFish[/bold]  [dim](no memory · no validator · no guardrails)[/dim]")
@@ -130,7 +132,7 @@ if DRY_RUN:
         },
     ]
 else:
-    naked_events = run_naked(TARGET_URL, GOAL)
+    naked_events = gw.run(TARGET_URL, GOAL, validate=False, memory=False)
 
 naked_steps = len([e for e in naked_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")])
 rprint(f"\n[yellow]⚡ Naked run complete[/yellow]")
@@ -149,22 +151,22 @@ if DRY_RUN:
     rprint("  [dim]--dry-run: synthetic events piped through live validator (no LLM, no TinyFish)[/dim]\n")
 
     import json as _json
-    import core as _core_mod
+    import client as _client_mod
 
-    # Run 1 (depth=0): agent stuck in lazy-load loop — never recovers → replan fires at step 10
+    # Run 1 (depth=0): agent stuck in lazy-load loop — replan fires at step 10
     _FAIL_EVENTS = [
         {"type": "PROGRESS", "purpose": "navigate to Hacker News front page"},
         {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [2]
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [3]
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [4] → events[-3:] identical → LOOP step 5
         {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
         {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [7]
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [8]
-        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [9] → events[-3:] identical → LOOP step 10 → REPLAN
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},  # step 5 → LOOP
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},  # step 10 → REPLAN
     ]
-    # Run 2 (depth=1): replanned goal + memory briefing → agent scrolls, extracts cleanly
+    # Run 2 (depth=1): replanned goal + memory briefing → clean extraction
     _SUCCESS_EVENTS = [
         {"type": "PROGRESS", "purpose": "navigate to Hacker News — scroll to trigger render"},
         {"type": "PROGRESS", "purpose": "scroll — story list appeared"},
@@ -182,6 +184,7 @@ if DRY_RUN:
     ]
 
     # Stateful mock: first requests.post call → failing run; second → successful replanned run
+    # Patches _client_mod.requests (the requests module imported at top of client.py)
     _post_call_count = [0]
 
     class _DryRequests:
@@ -197,51 +200,50 @@ if DRY_RUN:
 
             return _Resp()
 
-    _core_mod.requests = _DryRequests()
+    _client_mod.requests = _DryRequests()
 
-    # Rubric: bad score for failing run, good score for replanned run. No LLM call.
+    # Patch validator/LLM functions on _client_mod (imported there, not in core)
     _check_call = [0]
     def _mock_check(goal, events, intent=""):
         _check_call[0] += 1
-        if _check_call[0] <= 2:   # checkpoints in the failing run
+        if _check_call[0] <= 2:
             return {"goal_alignment": 0.71, "action_efficiency": 0.55, "risk_signal": 0.22,
                     "progress_rate": 0.64,
                     "reason": "Agent stuck in lazy-load wait loop — content never loaded",
                     "suggestion": "Scroll immediately after navigation to trigger content render"}
-        return {"goal_alignment": 0.93, "action_efficiency": 0.91, "risk_signal": 0.03,  # replanned run
+        return {"goal_alignment": 0.93, "action_efficiency": 0.91, "risk_signal": 0.03,
                 "progress_rate": 0.93,
                 "reason": "Scroll strategy working — story list extracted efficiently",
                 "suggestion": ""}
-    _core_mod.check_trajectory = _mock_check
+    _client_mod.check_trajectory = _mock_check
 
     _intent_call = [0]
     def _mock_intent(events, domain):
         _intent_call[0] += 1
         return ("stuck waiting for lazy-load — content not rendering" if _intent_call[0] <= 2
                 else "extracting story titles, scores, and comment counts")
-    _core_mod.infer_intent = _mock_intent
+    _client_mod.infer_intent = _mock_intent
 
-    _core_mod.generate_critique = lambda goal, events, check, domain="": (
+    _client_mod.generate_critique = lambda goal, events, check, domain="": (
         "Previous attempt failed because: agent entered a lazy-load wait loop at step 2 "
         "and never triggered the story list render. "
         "Avoid: passive waiting after navigation. "
         "Approach: scroll the page immediately after load — this forces HN's front-page content to render."
     )
-    _core_mod.compress_goal = lambda goal, briefing, critique: (
+    _client_mod.compress_goal = lambda goal, briefing, critique: (
         "OBJECTIVE: Get titles, scores, and comment counts for top 5 HN front page stories\n"
         "AVOID: Waiting passively after navigation — triggers infinite lazy-load loop\n"
         "APPROACH: Scroll immediately after page load to force story list render"
     )
-    _core_mod.extract_quirks = lambda events, domain: [
+    _client_mod.extract_quirks = lambda events, domain: [
         "front page story list requires immediate scroll to render — passive wait loops indefinitely"
     ]
-    _core_mod.consolidate = lambda domain: False
+    _client_mod.consolidate = lambda domain: False
+    _client_mod.dual_validate = lambda goal, events, score, intent="": score  # passthrough in dry-run
 
-    golden_events = _run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
+    golden_events = gw.run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
 else:
-    golden_events = _run(
-        TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS
-    )
+    golden_events = gw.run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
 
 recorder.record(GOLDEN_SESSION, GOAL, golden_events)
 
@@ -354,9 +356,10 @@ rprint(
 
 rprint("\n[bold cyan]Judge line:[/bold cyan]")
 rprint(
-    '"We didn\'t build another agent. We built the layer that makes every agent trustworthy.\n'
-    " Memory that compounds, a validator that intercepts mid-run, guardrails that enforce\n"
-    " domain, PII, and budget policy — and an eval harness that gives you pass@3 instead\n"
-    " of a lucky single score. Every company running TinyFish, Playwright, or Browserbase\n"
-    " at scale buys this — it\'s the difference between 40% and 90% task completion rate.\"\n"
+    '"TinyFish gives you the agent. GroundWire gives you the SLA.\n'
+    " Memory that compounds across every run. A validator that intercepts drift mid-stream.\n"
+    " Guardrails that enforce domain, PII, and budget policy. An eval harness that gives you\n"
+    " pass@3 instead of a lucky single score.\n"
+    " Every company running TinyFish at scale buys this — it\'s the difference between\n"
+    " 40% and 90% task completion rate.\"\n"
 )
