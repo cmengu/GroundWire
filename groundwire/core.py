@@ -1,3 +1,13 @@
+# core.py
+"""
+Groundwire core — Facade over TinyFish.
+
+Public interface:
+    run(url, goal, validate_every=..., guardrails=...) -> list[dict]
+
+Internal (frozen after Phase 1 Step 1.3 — body must not change without explicit review):
+    _stream_tinyfish(url, goal) -> list[dict]
+"""
 import json
 import os
 from pathlib import Path
@@ -8,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from guardrails import GuardrailStack
-from memory import extract_quirks, recall, write
+from memory import consolidate, extract_quirks, log_run, recall, write
 from validator import check_trajectory
 
 _here = Path(__file__).resolve().parent
@@ -19,7 +29,10 @@ TINYFISH_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 
 
 def _stream_tinyfish(url: str, goal: str) -> list[dict]:
-    """Raw SSE stream → list of event dicts."""
+    """
+    Pure HTTP layer. POSTs to TinyFish, collects all SSE events, returns them as a list.
+    FROZEN after Step 1.3 — only timeout/SSE handling; always call through run().
+    """
     resp = requests.post(
         TINYFISH_URL,
         headers={
@@ -28,7 +41,7 @@ def _stream_tinyfish(url: str, goal: str) -> list[dict]:
         },
         json={"url": url, "goal": goal},
         stream=True,
-        timeout=120,
+        timeout=180,
     )
     resp.raise_for_status()
 
@@ -44,6 +57,14 @@ def _stream_tinyfish(url: str, goal: str) -> list[dict]:
     return events
 
 
+def _infer_run_success(events: list[dict]) -> bool:
+    """True if TinyFish reported COMPLETED; else True when no COMPLETE event (best-effort)."""
+    for e in reversed(events):
+        if e.get("type") == "COMPLETE":
+            return e.get("status") == "COMPLETED"
+    return True
+
+
 def run(
     url: str,
     goal: str,
@@ -51,8 +72,8 @@ def run(
     guardrails: Optional[GuardrailStack] = None,
 ) -> list[dict]:
     """
-    Main entry point with memory, trajectory validation, and optional guardrails.
-    validate_every: check trajectory every N events. Set to 0 to disable.
+    Memory: recall → stream → extract/write → log_run → consolidate.
+    Optional: trajectory validation (every N events) and guardrail stack.
     """
     if guardrails:
         guardrails.pre_run(url, goal)
@@ -60,15 +81,18 @@ def run(
     domain = urlparse(url).netloc
 
     briefing = recall(domain)
-    enriched_goal = f"{briefing}\n\n{goal}" if briefing else goal
     if briefing:
-        print(f"[memory] Briefing loaded for {domain}")
+        for line in briefing.splitlines():
+            print(f"[memory] {line}")
+        enriched_goal = f"{briefing}\n\n{goal}"
+    else:
+        print(f"[memory] No prior memory for {domain} — cold start")
+        enriched_goal = goal
 
     raw_events = _stream_tinyfish(url, enriched_goal)
 
     events = []
     replanned = False
-
     for event in raw_events:
         events.append(event)
 
@@ -86,10 +110,20 @@ def run(
                 return run(url, corrected, validate_every=0, guardrails=guardrails)
             print(f"[validator] ✓ Step {len(events)} on track (confidence: {check['confidence']:.2f})")
 
+    print(f"[core] Run complete — {len(events)} events received")
+
     quirks = extract_quirks(events, domain)
     if quirks:
         write(domain, quirks)
-        print(f"[memory] Wrote {len(quirks)} quirks for {domain}")
+        print(f"[memory] Confidence updated for {len(quirks)} quirk(s): {quirks}")
+    else:
+        print(f"[memory] No new quirks extracted for {domain}")
+
+    log_run(domain, goal, events, success=_infer_run_success(events))
+    print("[memory] Run logged — episodic history updated")
+
+    if consolidate(domain):
+        print(f"[memory] ✦ Semantic profile updated for {domain}")
 
     if guardrails:
         result_str = json.dumps(events) if events else ""
@@ -104,14 +138,16 @@ if __name__ == "__main__":
     import sys
 
     from rich import print as rprint
+    from rich.panel import Panel
 
-    test_url = sys.argv[1] if len(sys.argv) > 1 else "https://news.ycombinator.com"
-    test_goal = (
+    target_url = sys.argv[1] if len(sys.argv) > 1 else "https://news.ycombinator.com"
+    target_goal = (
         sys.argv[2] if len(sys.argv) > 2 else "Get the title of the top post"
     )
 
-    print(f"Running: {test_goal}")
-    print(f"On: {test_url}\n")
-    result = run(test_url, test_goal)
-    rprint(f"[green]✓ Received {len(result)} events[/green]")
-    rprint(result[-3:])
+    rprint(Panel(f"[bold]URL:[/bold] {target_url}\n[bold]Goal:[/bold] {target_goal}"))
+    events = run(target_url, target_goal)
+    rprint(f"[green]✓ Received {len(events)} events[/green]")
+    rprint("[dim]Last 3 events:[/dim]")
+    for e in events[-3:]:
+        rprint(f"  {e}")

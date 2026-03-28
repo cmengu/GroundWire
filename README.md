@@ -24,7 +24,7 @@ Your Code  ->  [ Guardrails -> Memory -> Agent -> Validator -> Evals ]  ->  Resu
 
 **Site Memory**
 
-After each run, Groundwire asks Claude to pull out whatever site-specific quirks the agent encountered: cookie modals, auth walls, lazy-load timing, anti-bot patterns. These get saved per domain. On the next run, that briefing gets prepended to the goal before the agent ever touches the page.
+After each run, Groundwire asks Claude to pull out site-specific quirks (cookie modals, auth walls, lazy-load timing, anti-bot patterns) and stores them per domain with confidence scores. Each run is logged episodically; every third run, Claude synthesizes a one-sentence strategic profile. On the next run, a stratified briefing (run count, profile, top quirks) is prepended to the goal before the agent touches the page.
 
 Run 1: 34 steps, two wrong turns.
 Run 2: 21 steps. It already knew about the modal.
@@ -55,7 +55,7 @@ Composable rules that run before and after execution. Domain allowlists block of
 ```
 groundwire/
 ├── core.py          # Orchestration: runs TinyFish with memory-enriched goals
-├── memory.py        # Per-domain JSON store: quirks extracted after each run
+├── memory.py        # Per-domain JSON: confidence quirks, episodic runs, semantic profile
 ├── validator.py     # Claude-powered trajectory checker on live SSE stream
 ├── evals.py         # Record golden runs, score replays with faithfulness metric
 ├── guardrails.py    # Pluggable rules: allowlist, PII scrubber, action budget
