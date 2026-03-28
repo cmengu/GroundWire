@@ -27,6 +27,8 @@ from pathlib import Path
 
 import anthropic
 
+from guardrails import PIIScrubber as _PIIScrubberGuard
+
 from llm_utils import parse_structured
 from schemas import QuirksList, SemanticProfile
 
@@ -147,7 +149,10 @@ def write(domain: str, new_quirks: list[str]) -> None:
     Quirks matching email/phone patterns are dropped before persist.
     Does NOT increment run_count — that is owned by log_run().
     """
-    new_quirks = _filter_pii_quirks(list(new_quirks))
+    # Defence in depth: strip PII before any quirk reaches disk.
+    # Uses PIIScrubber._PATTERNS — same source of truth as evals._hard_gates().
+    _pii_re = re.compile("|".join(_PIIScrubberGuard._PATTERNS.values()))
+    new_quirks = [q for q in list(new_quirks) if q and not _pii_re.search(q)]
     if not new_quirks:
         return
 
