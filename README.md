@@ -3,6 +3,7 @@
 **Reliability middleware for web agents. One import. Seven features. Zero new infrastructure required.**
 
 > *"TinyFish gives you the agent. GroundWire gives you the SLA."*
+![Uploading Screenshot 2026-03-28 at 4.03.21 PM.png…]()
 
 ---
 
