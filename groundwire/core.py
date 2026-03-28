@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
-from guardrails import GuardrailStack
+from guardrails import GuardrailStack, _noop_stack
 from memory import consolidate, extract_quirks, log_run, recall, write
 from validator import (
     DRIFT_STREAK_REQUIRED,
@@ -92,8 +92,8 @@ def run(
     Memory recall → TinyFish stream with live validation (Phase 2) → memory write → log → consolidate.
     Validation order each checkpoint: deterministic guard → intent phrase → rubric LLM.
     """
-    if guardrails:
-        guardrails.pre_run(url, goal)
+    stack = guardrails if guardrails is not None else _noop_stack()
+    stack.pre_run(url, goal)
 
     domain = urlparse(url).netloc
     score_curve: list = _score_curve if _score_curve is not None else []
@@ -264,11 +264,10 @@ def run(
         }
     )
 
-    if guardrails:
-        result_str = json.dumps(events) if events else ""
-        scrubbed = guardrails.post_run(result_str, events)
-        if scrubbed != result_str:
-            print("[guardrail] Output scrubbed by post_run rules")
+    result_str = json.dumps(events) if events else ""
+    scrubbed = stack.post_run(result_str, events)
+    if scrubbed != result_str:
+        print("[guardrail] Output scrubbed by post_run rules")
 
     return events
 
