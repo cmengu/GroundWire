@@ -475,27 +475,29 @@ def memory_report(domain: str) -> str:
     semantic_profile = data.get("semantic_profile", "")
     quirks = [q for q in data.get("quirks", []) if isinstance(q, dict)]
 
-    border = "═" * 52
+    # Inner width = 67: matches title "  Groundwire Memory Report — " (29) + 36 domain + "  " (2)
+    border = "═" * 67
     lines = [
         f"╔{border}╗",
         f"║  Groundwire Memory Report — {domain[:36]:<36}  ║",
         f"╠{border}╣",
-        f"║  Runs: {run_count} total  ({len(real_runs)} real · {len(trial_runs)} eval trials){'':>14}║",
     ]
+
+    run_line = f"  Runs: {run_count} total  ({len(real_runs)} real · {len(trial_runs)} eval trials)"
+    lines.append(f"║{run_line:<67}║")
 
     if real_runs:
         success_count = sum(1 for r in real_runs if r.get("success", True))
         avg_steps = sum(r.get("step_count", 0) for r in real_runs) / len(real_runs)
-        lines.append(
-            f"║  Success: {success_count}/{len(real_runs)} real runs  ·  avg {avg_steps:.1f} steps/run{'':>12}║"
-        )
+        success_line = f"  Success: {success_count}/{len(real_runs)} real runs  ·  avg {avg_steps:.1f} steps/run"
+        lines.append(f"║{success_line:<67}║")
 
     if semantic_profile:
-        # Wrap to fit panel width (48 chars content)
+        # Wrap to fit panel content width (63 chars = 67 inner - 4 leading spaces)
         words = semantic_profile.split()
         line_buf, wrapped = [], []
         for word in words:
-            if sum(len(w) + 1 for w in line_buf) + len(word) > 48:
+            if sum(len(w) + 1 for w in line_buf) + len(word) > 63:
                 wrapped.append(" ".join(line_buf))
                 line_buf = [word]
             else:
@@ -503,20 +505,21 @@ def memory_report(domain: str) -> str:
         if line_buf:
             wrapped.append(" ".join(line_buf))
         lines.append(f"╠{border}╣")
-        lines.append(f"║  Profile:{'':>42}║")
+        lines.append(f"║  Profile:{'':>57}║")
         for wline in wrapped:
-            lines.append(f"║    {wline:<48}║")
+            lines.append(f"║    {wline:<63}║")
 
     if quirks:
         sorted_quirks = sorted(quirks, key=lambda q: q.get("confidence", 0), reverse=True)[:5]
         lines.append(f"╠{border}╣")
-        lines.append(f"║  Top quirks by confidence:{'':>25}║")
+        lines.append(f"║  Top quirks by confidence:{'':>40}║")
         for q in sorted_quirks:
             conf = q.get("confidence", 0)
-            text = q.get("text", "")[:40]
+            text = q.get("text", "")[:50]
             filled = min(5, int(conf))
             bar = "█" * filled + "░" * (5 - filled)
-            lines.append(f"║  {bar} {conf:.1f}x  {text:<40}  ║")
+            # Inner = 2 + 5(bar) + 1 + 5(conf:4.1f + "x") + 2 + 50(text) + 2 = 67
+            lines.append(f"║  {bar} {conf:4.1f}x  {text:<50}  ║")
 
     lines.append(f"╚{border}╝")
     return "\n".join(lines)
