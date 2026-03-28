@@ -5,7 +5,7 @@ Groundwire core — Facade over TinyFish.
 Public interface:
     run(url, goal, validate_every=..., guardrails=...) -> list[dict]
 
-Internal (frozen after Phase 1 Step 1.3 — body must not change without explicit review):
+Internal (frozen after Phase 1 Step 1.3 — do not change without review):
     _stream_tinyfish(url, goal) -> list[dict]
 """
 import json
@@ -19,7 +19,15 @@ from dotenv import load_dotenv
 
 from guardrails import GuardrailStack
 from memory import consolidate, extract_quirks, log_run, recall, write
-from validator import check_trajectory
+from validator import (
+    DRIFT_STREAK_REQUIRED,
+    DRIFT_THRESHOLD,
+    check_trajectory,
+    compress_goal,
+    detect_deterministic_signals,
+    generate_critique,
+    infer_intent,
+)
 
 _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
@@ -27,11 +35,14 @@ load_dotenv(_here.parent / ".env")
 
 TINYFISH_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 
+# Hard cap on replan attempts (Phase 2). Visible orchestration policy.
+MAX_REPLANS = 1
+
 
 def _stream_tinyfish(url: str, goal: str) -> list[dict]:
     """
     Pure HTTP layer. POSTs to TinyFish, collects all SSE events, returns them as a list.
-    FROZEN after Step 1.3 — only timeout/SSE handling; always call through run().
+    FROZEN after Step 1.3 — only timeout/SSE handling; always call through run() for live validation.
     """
     resp = requests.post(
         TINYFISH_URL,
@@ -70,15 +81,19 @@ def run(
     goal: str,
     validate_every: int = 5,
     guardrails: Optional[GuardrailStack] = None,
+    _score_curve: Optional[list] = None,
+    _depth: int = 0,
 ) -> list[dict]:
     """
-    Memory: recall → stream → extract/write → log_run → consolidate.
-    Optional: trajectory validation (every N events) and guardrail stack.
+    Memory recall → TinyFish stream with live validation (Phase 2) → memory write → log → consolidate.
+    Validation order each checkpoint: deterministic guard → intent phrase → rubric LLM.
     """
     if guardrails:
         guardrails.pre_run(url, goal)
 
     domain = urlparse(url).netloc
+    score_curve: list = _score_curve if _score_curve is not None else []
+    drift_streak = 0
 
     briefing = recall(domain)
     if briefing:
@@ -89,41 +104,119 @@ def run(
         print(f"[memory] No prior memory for {domain} — cold start")
         enriched_goal = goal
 
-    raw_events = _stream_tinyfish(url, enriched_goal)
+    # Live stream (duplicated from _stream_tinyfish pattern — _stream_tinyfish body unchanged)
+    resp = requests.post(
+        TINYFISH_URL,
+        headers={
+            "X-API-Key": os.getenv("TINYFISH_API_KEY"),
+            "Content-Type": "application/json",
+        },
+        json={"url": url, "goal": enriched_goal},
+        stream=True,
+        timeout=180,
+    )
+    resp.raise_for_status()
 
-    events = []
-    replanned = False
-    for event in raw_events:
+    events: list[dict] = []
+
+    for raw_line in resp.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8")
+        if not line.startswith("data: "):
+            continue
+        try:
+            event = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+
         events.append(event)
 
-        if validate_every > 0 and len(events) % validate_every == 0 and not replanned:
+        if validate_every > 0 and len(events) % validate_every == 0:
+            det = detect_deterministic_signals(events)
+            if det["loop"]:
+                print(f"[validator] ⚡ Loop detected (deterministic): {det['reason']}")
+                drift_streak += 1
+            if det["irreversible"]:
+                print(f"[validator] ⚠  Irreversible action detected: {det['reason']}")
+
+            intent = infer_intent(events, domain)
+            if intent:
+                print(f"[validator] Intent: {intent}")
+
             check = check_trajectory(goal, events)
-            if not check["on_track"] and check["confidence"] < 0.65:
-                print(f"[validator] ⚠️  Deviation at step {len(events)}: {check['reason']}")
-                print(f"[validator] Replanning: {check['suggestion']}")
-                replanned = True
-                corrected = (
-                    f"Original goal: {goal}\n\n"
-                    f"Correction: {check['suggestion']}\n\n"
-                    f"Context: agent ran {len(events)} steps before deviation was detected."
-                )
-                return run(url, corrected, validate_every=0, guardrails=guardrails)
-            print(f"[validator] ✓ Step {len(events)} on track (confidence: {check['confidence']:.2f})")
+            score_curve.append(check["progress_rate"])
+            print(
+                f"[validator] step {len(events):>3} | "
+                f"progress={check['progress_rate']:.2f} | "
+                f"align={check['goal_alignment']:.2f} | "
+                f"eff={check['action_efficiency']:.2f} | "
+                f"risk={check['risk_signal']:.2f}"
+            )
+
+            if check["progress_rate"] < DRIFT_THRESHOLD or det["loop"]:
+                if check["progress_rate"] < DRIFT_THRESHOLD and not det["loop"]:
+                    drift_streak += 1
+                print(f"[validator] ⚠  Drift signal ({drift_streak}/{DRIFT_STREAK_REQUIRED}): {check['reason']}")
+
+                if drift_streak >= DRIFT_STREAK_REQUIRED and _depth < MAX_REPLANS:
+                    print("[validator] ✗  Drift confirmed — generating Reflexion critique")
+                    critique = generate_critique(goal, events, check)
+                    print(f"[validator] Critique: {critique}")
+                    score_curve.append("REPLAN")
+
+                    quirks = extract_quirks(events, domain)
+                    if quirks:
+                        write(domain, quirks)
+                    log_run(domain, goal, events, success=False)
+                    consolidate(domain)
+
+                    replanned_goal = compress_goal(goal, briefing or "", critique)
+                    print(f"[validator] Compressed replanned goal: {replanned_goal[:120]}...")
+                    print(f"[validator] Replanning (attempt {_depth + 1}/{MAX_REPLANS})\n")
+                    return run(
+                        url,
+                        replanned_goal,
+                        validate_every,
+                        guardrails,
+                        _score_curve=score_curve,
+                        _depth=_depth + 1,
+                    )
+
+                if drift_streak >= DRIFT_STREAK_REQUIRED and _depth >= MAX_REPLANS:
+                    print(
+                        f"[validator] ✗  Drift confirmed but MAX_REPLANS={MAX_REPLANS} "
+                        "reached — continuing without replan"
+                    )
+            else:
+                if drift_streak > 0:
+                    print(f"[validator] ✓  Drift streak cleared (was {drift_streak})")
+                drift_streak = 0
 
     print(f"[core] Run complete — {len(events)} events received")
 
     quirks = extract_quirks(events, domain)
     if quirks:
         write(domain, quirks)
-        print(f"[memory] Confidence updated for {len(quirks)} quirk(s): {quirks}")
+        print(f"[memory] Confidence updated for {len(quirks)} quirk(s)")
     else:
         print(f"[memory] No new quirks extracted for {domain}")
 
     log_run(domain, goal, events, success=_infer_run_success(events))
-    print("[memory] Run logged — episodic history updated")
+    print("[memory] Run logged")
 
     if consolidate(domain):
         print(f"[memory] ✦ Semantic profile updated for {domain}")
+
+    print(f"\n📊 Score curve: {score_curve}")
+
+    events.append(
+        {
+            "type": "groundwire_meta",
+            "score_curve": score_curve,
+            "replan_count": score_curve.count("REPLAN"),
+        }
+    )
 
     if guardrails:
         result_str = json.dumps(events) if events else ""
@@ -146,8 +239,8 @@ if __name__ == "__main__":
     )
 
     rprint(Panel(f"[bold]URL:[/bold] {target_url}\n[bold]Goal:[/bold] {target_goal}"))
-    events = run(target_url, target_goal)
-    rprint(f"[green]✓ Received {len(events)} events[/green]")
+    out = run(target_url, target_goal)
+    rprint(f"[green]✓ Received {len(out)} events[/green]")
     rprint("[dim]Last 3 events:[/dim]")
-    for e in events[-3:]:
+    for e in out[-3:]:
         rprint(f"  {e}")
