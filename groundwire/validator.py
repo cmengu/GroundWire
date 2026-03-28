@@ -46,6 +46,24 @@ IRREVERSIBLE_KEYWORDS = {
     "place order",
 }
 
+# Keywords that appear in repeated actions when a CAPTCHA/challenge page has stalled the agent.
+# A loop containing any of these is classified as a CAPTCHA stall, not a generic loop.
+# This keeps CAPTCHA escalation (human-in-loop) separate from normal drift (replan).
+CAPTCHA_SIGNALS = {
+    "challenge",
+    "verify",
+    "cloudflare",
+    "captcha",
+    "datadome",
+    "recaptcha",
+    "hcaptcha",
+    "turnstile",
+    "bot",
+    "robot",
+    "access denied",
+    "checking your browser",
+}
+
 
 def _event_step_str(e: dict) -> str:
     """Human-readable step label for TinyFish SSE (purpose on PROGRESS) and fallbacks."""
@@ -141,9 +159,21 @@ def check_trajectory(goal: str, events_so_far: list[dict], intent: str = "") -> 
 
 def detect_deterministic_signals(events: list[dict]) -> dict:
     """
-    Loop + irreversibility detection, zero LLM calls. Never raises.
+    Loop + irreversibility + CAPTCHA detection. Zero LLM calls. Never raises.
+
+    Returns:
+        {
+            "loop": bool,             # True if 3 identical consecutive actions (non-CAPTCHA)
+            "captcha_detected": bool, # True if loop contains CAPTCHA/challenge keywords
+            "irreversible": bool,     # True if irreversible action in last 3 events
+            "reason": str,
+        }
+
+    CAPTCHA and loop are mutually exclusive: if a loop contains CAPTCHA signals,
+    captcha_detected is True and loop is False. This ensures CAPTCHA stalls
+    escalate to human review rather than triggering a replan.
     """
-    _safe = {"loop": False, "irreversible": False, "reason": ""}
+    _safe = {"loop": False, "captcha_detected": False, "irreversible": False, "reason": ""}
     if not events:
         return _safe
     try:
@@ -153,6 +183,16 @@ def detect_deterministic_signals(events: list[dict]) -> dict:
             and len(set(recent_actions)) == 1
             and recent_actions[0] != ""
         )
+
+        # Classify loop: CAPTCHA stall vs generic navigation loop.
+        captcha_detected = False
+        if loop_detected:
+            repeated_action = recent_actions[0].lower()
+            # Check repeated action string for CAPTCHA signal keywords.
+            if any(sig in repeated_action for sig in CAPTCHA_SIGNALS):
+                captcha_detected = True
+                loop_detected = False  # CAPTCHA and loop are mutually exclusive
+
         irreversible_detected = False
         irreversible_reason = ""
         for event in events[-3:]:
@@ -162,13 +202,18 @@ def detect_deterministic_signals(events: list[dict]) -> dict:
                 irreversible_detected = True
                 irreversible_reason = f"Irreversible keyword detected: {', '.join(matched)}"
                 break
+
         reasons = []
-        if loop_detected:
+        if captcha_detected:
+            reasons.append(f"CAPTCHA/challenge stall detected: '{recent_actions[0]}'")
+        elif loop_detected:
             reasons.append(f"3 identical consecutive actions: '{recent_actions[0]}'")
         if irreversible_reason:
             reasons.append(irreversible_reason)
+
         return {
             "loop": loop_detected,
+            "captcha_detected": captcha_detected,
             "irreversible": irreversible_detected,
             "reason": "; ".join(reasons),
         }
