@@ -20,9 +20,13 @@ Tool choice note (for verbal delivery if asked about OpenAI):
    LLM judge — is model-agnostic and can swap in any provider."
 
 Usage:
-  python demo.py            # live (TINYFISH_API_KEY + ANTHROPIC_API_KEY required)
-  python demo.py --dry-run  # mock events only — no network, no API keys needed
+  python demo.py                      # live (TINYFISH_API_KEY + ANTHROPIC_API_KEY required)
+  python demo.py --dry-run            # mock events — no network, no API keys needed
+  python demo.py --skip-naked         # skip Run 0; Run 1 golden + trials (after a Ctrl+C mid-demo)
+  python demo.py --skip-naked --naked-steps 30   # same; scorecard uses your last naked step count
+  python demo.py --trials-only        # only Runs 2–4; requires .groundwire_evals/<session>.json
 """
+import json
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -60,7 +64,41 @@ def _sparkline(values: list) -> str:
     return "".join(parts)
 
 
+def _eval_session_file(session_id: str) -> Path:
+    """Same filename rules as evals._session_path (local import avoided)."""
+    safe = session_id.replace("/", "_").replace(":", "_").replace(" ", "_")
+    return Path(".groundwire_evals") / f"{safe}.json"
+
+
+def _golden_stats_from_disk(session_id: str) -> tuple[list[dict], int, list, int]:
+    """
+    Load a recorded golden session for --trials-only scorecard + metadata.
+    Returns (events, step_count_ex_meta, score_curve, llm_call_count).
+    """
+    path = _eval_session_file(session_id)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    events = data.get("events", [])
+    steps = int(data.get("step_count", 0))
+    curve = data.get("score_curve", [])
+    llm_calls = 0
+    for ev in reversed(events):
+        if ev.get("type") == "groundwire_meta":
+            llm_calls = int(ev.get("llm_call_count", 0))
+            curve = ev.get("score_curve", curve)
+            break
+    return events, steps, curve, llm_calls
+
+
 DRY_RUN = "--dry-run" in sys.argv
+SKIP_NAKED = "--skip-naked" in sys.argv
+TRIALS_ONLY = "--trials-only" in sys.argv
+NAKED_STEPS_OVERRIDE: int | None = None
+for _ai, _arg in enumerate(sys.argv):
+    if _arg == "--naked-steps" and _ai + 1 < len(sys.argv):
+        NAKED_STEPS_OVERRIDE = int(sys.argv[_ai + 1])
+        break
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TARGET_URL = "https://policies.google.com/privacy"
@@ -107,161 +145,272 @@ rprint(
 
 gw = GroundWire.from_env()
 
-# ── Run 0 — Naked TinyFish baseline (no memory, no validator, no guardrails) ──
-rprint(Rule())
-rprint("\n[bold]Run 0 — Naked TinyFish[/bold]  [dim](no memory · no validator · no guardrails)[/dim]")
-rprint("[dim]Agent reads the compliance page but detects no change — silent failure.[/dim]\n")
-
-if DRY_RUN:
-    rprint("  [dim]--dry-run: synthetic naked events (no TinyFish)[/dim]\n")
-    naked_events = [
-        {"type": "PROGRESS", "purpose": "Navigate to Google Privacy Policy"},
-        {"type": "PROGRESS", "purpose": "Scroll through policy sections"},
-        {"type": "PROGRESS", "purpose": "Read Data Safety section"},
-        {"type": "PROGRESS", "purpose": "Read Data Sharing section"},
-        {"type": "PROGRESS", "purpose": "Scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "Scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "Scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "Scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "Scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "No changes detected — page read complete"},
-        {
-            "type": "COMPLETE",
-            "status": "COMPLETED",
-            "result": {"change_detected": False, "flagged_clauses": []},
-        },
-    ]
-else:
-    naked_events = gw.run(TARGET_URL, GOAL, validate=False, memory=False)
-
-naked_steps = len([e for e in naked_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")])
-rprint(f"\n[yellow]⚡ Naked run complete[/yellow]")
-rprint(f"  Steps:          [bold]{naked_steps}[/bold]  (no memory briefing, no validator, no guardrails)")
-rprint(f"  Score curve:    [dim]not computed (validator not running)[/dim]")
-rprint(f"  LLM calls:      [dim]0 (pure TinyFish — no Groundwire layer)[/dim]\n")
-
-# ── Run 1 — Golden session (cold start, memory writes) ────────────────────────
-rprint(Rule())
-rprint("\n[bold]Run 1 — Groundwire Golden Session[/bold]  [dim](cold start · memory writes · validator active)[/dim]")
-rprint("[dim]First run records baseline policy state. Validator fires every 5 events. GroundWire writes the navigation pattern to memory.[/dim]\n")
-
 recorder = SessionRecorder()
 
-if DRY_RUN:
-    rprint("  [dim]--dry-run: synthetic events piped through live validator (no LLM, no TinyFish)[/dim]\n")
+if TRIALS_ONLY:
+    # Runs 2–4 only: golden must exist from a completed Run 1 (demo.py or --skip-naked).
+    rprint(Rule())
+    rprint(
+        "\n[bold]Resume — scored trials only[/bold]  "
+        "[dim](skipping Run 0 and Run 1; using saved golden session)[/dim]"
+    )
+    golden_path = _eval_session_file(GOLDEN_SESSION)
+    try:
+        golden_events, golden_steps, golden_curve, golden_llm_calls = _golden_stats_from_disk(
+            GOLDEN_SESSION
+        )
+    except FileNotFoundError:
+        rprint(
+            f"\n[red]Missing golden file:[/red] {golden_path}\n"
+            f"[dim]Finish Run 1 first:[/dim] [bold]python demo.py --skip-naked[/bold] "
+            f"[dim](from the[/dim] [bold]groundwire[/bold] [dim]directory), then retry.[/dim]\n"
+        )
+        sys.exit(1)
+    golden_meta = next(
+        (e for e in reversed(golden_events) if e.get("type") == "groundwire_meta"), {}
+    )
+    naked_steps = NAKED_STEPS_OVERRIDE if NAKED_STEPS_OVERRIDE is not None else 30
+    rprint(
+        f"[dim]Naked baseline steps for scorecard:[/dim] [bold]{naked_steps}[/bold] "
+        f"[dim](set with[/dim] [bold]--naked-steps N[/bold][dim]; default 30)[/dim]\n"
+    )
 
-    import json as _json
-    import client as _client_mod
+else:
+    # ── Run 0 — Naked TinyFish baseline (no memory, no validator, no guardrails) ──
+    rprint(Rule())
+    rprint(
+        "\n[bold]Run 0 — Naked TinyFish[/bold]  "
+        "[dim](no memory · no validator · no guardrails)[/dim]"
+    )
+    rprint("[dim]Agent reads the compliance page but detects no change — silent failure.[/dim]\n")
 
-    # Run 1 (depth=0): agent navigates the policy page but never detects any change — silent failure
-    _FAIL_EVENTS = [
-        {"type": "PROGRESS", "purpose": "navigate to Google Privacy Policy page"},
-        {"type": "PROGRESS", "purpose": "scroll through policy sections"},
-        {"type": "PROGRESS", "purpose": "read Data Safety section"},
-        {"type": "PROGRESS", "purpose": "read Data Sharing section"},
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [5]
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [6]
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [7] → 3 identical → LOOP step 8
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [8]
-        {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [9] → LOOP step 10 → REPLAN
-    ]
-    # Run 2 (depth=1): replanned goal + memory briefing → agent detects new data-sharing clause
-    _SUCCESS_EVENTS = [
-        {"type": "PROGRESS", "purpose": "navigate to Google Privacy Policy — check for changes"},
-        {"type": "PROGRESS", "purpose": "compare Data Sharing section to recorded version"},
-        {"type": "PROGRESS", "purpose": "detected new clause: data shared with third-party ad measurement partners"},
-        {"type": "PROGRESS", "purpose": "flag change: 'Ad measurement' subsection added under Data Sharing"},
-        {"type": "PROGRESS", "purpose": "extract full text of new clause for audit record"},
-        {"type": "COMPLETE", "status": "COMPLETED",
-         "result": {
-             "change_detected": True,
-             "flagged_clauses": [
-                 {
-                     "section": "Data Sharing",
-                     "change_type": "new_clause",
-                     "description": "Ad measurement subsection added — data now shared with third-party ad measurement partners for conversion tracking.",
-                 }
-             ],
-             "unchanged_sections": ["Data Safety", "Data Retention", "Your Controls"],
-         }},
-    ]
+    if SKIP_NAKED:
+        naked_steps = NAKED_STEPS_OVERRIDE if NAKED_STEPS_OVERRIDE is not None else 30
+        rprint(
+            "  [yellow]Skipped[/yellow] [dim](--skip-naked). Using "
+            f"[bold]{naked_steps}[/bold] naked steps for the scorecard "
+            f"(override: [bold]--naked-steps N[/bold]).[/dim]\n"
+        )
+    elif DRY_RUN:
+        rprint("  [dim]--dry-run: synthetic naked events (no TinyFish)[/dim]\n")
+        naked_events = [
+            {"type": "PROGRESS", "purpose": "Navigate to Google Privacy Policy"},
+            {"type": "PROGRESS", "purpose": "Scroll through policy sections"},
+            {"type": "PROGRESS", "purpose": "Read Data Safety section"},
+            {"type": "PROGRESS", "purpose": "Read Data Sharing section"},
+            {"type": "PROGRESS", "purpose": "Scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "Scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "Scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "Scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "Scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "No changes detected — page read complete"},
+            {
+                "type": "COMPLETE",
+                "status": "COMPLETED",
+                "result": {"change_detected": False, "flagged_clauses": []},
+            },
+        ]
+        naked_steps = len(
+            [e for e in naked_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")]
+        )
+        rprint(f"\n[yellow]⚡ Naked run complete[/yellow]")
+        rprint(
+            f"  Steps:          [bold]{naked_steps}[/bold]  "
+            f"(no memory briefing, no validator, no guardrails)"
+        )
+        rprint(f"  Score curve:    [dim]not computed (validator not running)[/dim]")
+        rprint(
+            f"  LLM calls:      [dim]0 (GroundWire validator off; TinyFish may still use models)[/dim]\n"
+        )
+    else:
+        naked_events = gw.run(TARGET_URL, GOAL, validate=False, memory=False)
+        naked_steps = len(
+            [e for e in naked_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")]
+        )
+        rprint(f"\n[yellow]⚡ Naked run complete[/yellow]")
+        rprint(
+            f"  Steps:          [bold]{naked_steps}[/bold]  "
+            f"(no memory briefing, no validator, no guardrails)"
+        )
+        rprint(f"  Score curve:    [dim]not computed (validator not running)[/dim]")
+        rprint(
+            f"  LLM calls:      [dim]0 (GroundWire validator off; TinyFish may still use models)[/dim]\n"
+        )
 
-    # Stateful mock: first requests.post call → failing run; second → successful replanned run
-    # Patches _client_mod.requests (the requests module imported at top of client.py)
-    _post_call_count = [0]
+    # ── Run 1 — Golden session (cold start, memory writes) ────────────────────
+    rprint(Rule())
+    rprint(
+        "\n[bold]Run 1 — Groundwire Golden Session[/bold]  "
+        "[dim](cold start · memory writes · validator active)[/dim]"
+    )
+    rprint(
+        "[dim]First run records baseline policy state. Validator fires every 5 events. "
+        "GroundWire writes the navigation pattern to memory.[/dim]\n"
+    )
 
-    class _DryRequests:
-        def post(self, *args, **kwargs):
-            _post_call_count[0] += 1
+    if DRY_RUN:
+        rprint(
+            "  [dim]--dry-run: synthetic events piped through live validator "
+            "(no LLM, no TinyFish)[/dim]\n"
+        )
 
-            class _Resp:
-                def raise_for_status(self): pass
-                def iter_lines(self, **kwargs):
-                    src = _FAIL_EVENTS if _post_call_count[0] == 1 else _SUCCESS_EVENTS
-                    for e in src:
-                        yield f"data: {_json.dumps(e)}".encode("utf-8")
+        import json as _json
+        import client as _client_mod
 
-            return _Resp()
+        # Run 1 (depth=0): agent navigates the policy page but never detects any change — silent failure
+        _FAIL_EVENTS = [
+            {"type": "PROGRESS", "purpose": "navigate to Google Privacy Policy page"},
+            {"type": "PROGRESS", "purpose": "scroll through policy sections"},
+            {"type": "PROGRESS", "purpose": "read Data Safety section"},
+            {"type": "PROGRESS", "purpose": "read Data Sharing section"},
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [5]
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [6]
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [7] → 3 identical → LOOP step 8
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [8]
+            {"type": "PROGRESS", "purpose": "scroll to end of page"},   # [9] → LOOP step 10 → REPLAN
+        ]
+        # Run 2 (depth=1): replanned goal + memory briefing → agent detects new data-sharing clause
+        _SUCCESS_EVENTS = [
+            {"type": "PROGRESS", "purpose": "navigate to Google Privacy Policy — check for changes"},
+            {"type": "PROGRESS", "purpose": "compare Data Sharing section to recorded version"},
+            {
+                "type": "PROGRESS",
+                "purpose": "detected new clause: data shared with third-party ad measurement partners",
+            },
+            {
+                "type": "PROGRESS",
+                "purpose": "flag change: 'Ad measurement' subsection added under Data Sharing",
+            },
+            {"type": "PROGRESS", "purpose": "extract full text of new clause for audit record"},
+            {
+                "type": "COMPLETE",
+                "status": "COMPLETED",
+                "result": {
+                    "change_detected": True,
+                    "flagged_clauses": [
+                        {
+                            "section": "Data Sharing",
+                            "change_type": "new_clause",
+                            "description": (
+                                "Ad measurement subsection added — data now shared with third-party "
+                                "ad measurement partners for conversion tracking."
+                            ),
+                        }
+                    ],
+                    "unchanged_sections": ["Data Safety", "Data Retention", "Your Controls"],
+                },
+            },
+        ]
 
-    _client_mod.requests = _DryRequests()
+        # Stateful mock: first requests.post call → failing run; second → successful replanned run
+        # Patches _client_mod.requests (the requests module imported at top of client.py)
+        _post_call_count = [0]
 
-    # Patch validator/LLM functions on _client_mod (imported there, not in core)
-    _check_call = [0]
-    def _mock_check(goal, events, intent=""):
-        _check_call[0] += 1
-        if _check_call[0] <= 2:
-            return {"goal_alignment": 0.71, "action_efficiency": 0.55, "risk_signal": 0.22,
+        class _DryRequests:
+            def post(self, *args, **kwargs):
+                _post_call_count[0] += 1
+
+                class _Resp:
+                    def raise_for_status(self):
+                        pass
+
+                    def iter_lines(self, **kwargs):
+                        src = _FAIL_EVENTS if _post_call_count[0] == 1 else _SUCCESS_EVENTS
+                        for e in src:
+                            yield f"data: {_json.dumps(e)}".encode("utf-8")
+
+                return _Resp()
+
+        _client_mod.requests = _DryRequests()
+
+        # Patch validator/LLM functions on _client_mod (imported there, not in core)
+        _check_call = [0]
+
+        def _mock_check(goal, events, intent=""):
+            _check_call[0] += 1
+            if _check_call[0] <= 2:
+                return {
+                    "goal_alignment": 0.71,
+                    "action_efficiency": 0.55,
+                    "risk_signal": 0.22,
                     "progress_rate": 0.64,
                     "reason": "Agent scrolling through policy but producing no change detection output",
-                    "suggestion": "Compare current page text to stored baseline — check for clause additions"}
-        return {"goal_alignment": 0.93, "action_efficiency": 0.91, "risk_signal": 0.03,
+                    "suggestion": "Compare current page text to stored baseline — check for clause additions",
+                }
+            return {
+                "goal_alignment": 0.93,
+                "action_efficiency": 0.91,
+                "risk_signal": 0.03,
                 "progress_rate": 0.93,
                 "reason": "Agent identified new data-sharing clause and flagged it correctly",
-                "suggestion": ""}
-    _client_mod.check_trajectory = _mock_check
+                "suggestion": "",
+            }
 
-    _intent_call = [0]
-    def _mock_intent(events, domain):
-        _intent_call[0] += 1
-        return ("reading policy sections without change detection" if _intent_call[0] <= 2
-                else "comparing Data Sharing section to baseline — new clause detected")
-    _client_mod.infer_intent = _mock_intent
+        _client_mod.check_trajectory = _mock_check
 
-    _client_mod.generate_critique = lambda goal, events, check, domain="": (
-        "Previous attempt failed because: agent read the policy page but never compared it to a stored baseline. "
-        "Avoid: passive reading without comparison. "
-        "Approach: load the stored page snapshot from memory, diff section by section, flag additions."
+        _intent_call = [0]
+
+        def _mock_intent(events, domain):
+            _intent_call[0] += 1
+            return (
+                "reading policy sections without change detection"
+                if _intent_call[0] <= 2
+                else "comparing Data Sharing section to baseline — new clause detected"
+            )
+
+        _client_mod.infer_intent = _mock_intent
+
+        _client_mod.generate_critique = lambda goal, events, check, domain="": (
+            "Previous attempt failed because: agent read the policy page but never compared it to a stored baseline. "
+            "Avoid: passive reading without comparison. "
+            "Approach: load the stored page snapshot from memory, diff section by section, flag additions."
+        )
+        _client_mod.compress_goal = lambda goal, briefing, critique: (
+            "OBJECTIVE: Detect changes in Google Privacy Policy — flag new data-sharing clauses vs baseline\n"
+            "AVOID: Reading the page without comparing to stored baseline version\n"
+            "APPROACH: Load stored snapshot from memory, compare Data Sharing section, flag any additions"
+        )
+        _client_mod.extract_quirks = lambda events, domain: [
+            "policy page uses lazy-loaded section headers — scroll required before section text is accessible"
+        ]
+        _client_mod.consolidate = lambda domain: False
+        _client_mod.dual_validate = lambda goal, events, score, intent="": score  # passthrough in dry-run
+
+        golden_events = gw.run(
+            TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS
+        )
+    else:
+        golden_events = gw.run(
+            TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS
+        )
+
+    recorder.record(GOLDEN_SESSION, GOAL, golden_events)
+
+    golden_meta = next(
+        (e for e in reversed(golden_events) if e.get("type") == "groundwire_meta"), {}
     )
-    _client_mod.compress_goal = lambda goal, briefing, critique: (
-        "OBJECTIVE: Detect changes in Google Privacy Policy — flag new data-sharing clauses vs baseline\n"
-        "AVOID: Reading the page without comparing to stored baseline version\n"
-        "APPROACH: Load stored snapshot from memory, compare Data Sharing section, flag any additions"
+    golden_steps = len(
+        [e for e in golden_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")]
     )
-    _client_mod.extract_quirks = lambda events, domain: [
-        "policy page uses lazy-loaded section headers — scroll required before section text is accessible"
-    ]
-    _client_mod.consolidate = lambda domain: False
-    _client_mod.dual_validate = lambda goal, events, score, intent="": score  # passthrough in dry-run
-
-    golden_events = gw.run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
-else:
-    golden_events = gw.run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
-
-recorder.record(GOLDEN_SESSION, GOAL, golden_events)
-
-golden_meta = next((e for e in reversed(golden_events) if e.get("type") == "groundwire_meta"), {})
-golden_steps = len([e for e in golden_events if e.get("type") not in ("groundwire_meta", "HEARTBEAT")])
-golden_curve = golden_meta.get("score_curve", [])
-golden_llm_calls = golden_meta.get("llm_call_count", 0)
+    golden_curve = golden_meta.get("score_curve", [])
+    golden_llm_calls = golden_meta.get("llm_call_count", 0)
 
 curve_str = (
     f"{_sparkline(golden_curve)}  "
     f"{' '.join(f'{s:.2f}' if isinstance(s, float) else str(s) for s in golden_curve)}"
 )
 
-rprint(f"\n[green]✓ Golden session recorded[/green]")
-rprint(f"  Steps:        [bold]{golden_steps}[/bold]  (vs naked: [bold]{naked_steps}[/bold] — memory saves {max(0, naked_steps - golden_steps)} steps)")
+_golden_done = (
+    "[green]✓ Golden session loaded from disk[/green]"
+    if TRIALS_ONLY
+    else "[green]✓ Golden session recorded[/green]"
+)
+rprint(f"\n{_golden_done}")
+rprint(
+    f"  Steps:        [bold]{golden_steps}[/bold]  "
+    f"(vs naked: [bold]{naked_steps}[/bold] — memory saves {max(0, naked_steps - golden_steps)} steps)"
+)
 rprint(f"  Score curve:  [{curve_str}]")
 rprint(f"  LLM calls:    {golden_llm_calls}  (validator + quirk extraction + consolidation)")
 rprint(f"  Session ID:   {GOLDEN_SESSION}\n")
@@ -364,12 +513,31 @@ rprint(
     )
 )
 
-rprint("\n[bold cyan]Judge line:[/bold cyan]")
-rprint(
-    '"Agents fail silently when pages change. Groundwire is the first to know.\n'
-    " Run 0: the naked agent read the policy and reported nothing — the new data-sharing\n"
-    " clause was invisible to it. Run 1: GroundWire caught it, flagged it, and wrote the\n"
-    " navigation pattern to memory. Trials 2–4 confirm the detection is reproducible.\n"
-    " Every company running compliance agents at scale buys this — it\'s the difference\n"
-    ' between a silent miss and a logged, auditable catch."\n'
+# Judge line varies based on whether the golden run actually detected a policy change.
+# In --dry-run mode or when the live policy has changed, use the change-detection story.
+# In live mode with no change, use the audit-trail story (still compelling and honest).
+_change_detected = any(
+    e.get("type") == "COMPLETE" and e.get("result", {}).get("change_detected")
+    for e in golden_events
 )
+
+rprint("\n[bold cyan]Judge line:[/bold cyan]")
+if _change_detected:
+    rprint(
+        '"Agents fail silently when pages change. Groundwire is the first to know.\n'
+        " Run 0: the naked agent read the policy and reported nothing — the new data-sharing\n"
+        " clause was invisible to it. Run 1: GroundWire caught it, flagged it, and wrote the\n"
+        " navigation pattern to memory. Trials 2–4 confirm the detection is reproducible.\n"
+        " Every company running compliance agents at scale buys this — it\'s the difference\n"
+        ' between a silent miss and a logged, auditable catch."\n'
+    )
+else:
+    rprint(
+        '"Compliance agents fail in two ways: they miss real changes, and they can\'t prove\n'
+        " they checked. Groundwire solves both. Run 0: naked agent reads the policy — but\n"
+        " can you reproduce that result next week? Can you prove what it found? Run 1:\n"
+        " GroundWire structured the comparison, wrote the navigation pattern to memory, and\n"
+        " produced a reproducible audit record. Trials 2–4 confirm the check is reproducible\n"
+        " with a faithfulness score. Every company running compliance at scale buys this —\n"
+        ' not just for change detection, but for the audit trail that proves you looked."\n'
+    )

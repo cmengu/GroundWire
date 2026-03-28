@@ -153,22 +153,31 @@ class GroundWire:
     "TinyFish gives you the agent. GroundWire gives you the SLA."
     """
 
-    def __init__(self, tinyfish_api_key: str, anthropic_api_key: str):
+    def __init__(
+        self,
+        tinyfish_api_key: str,
+        anthropic_api_key: str,
+        openai_api_key: str = "",
+    ):
         self._tinyfish_api_key = tinyfish_api_key
         self._anthropic_api_key = anthropic_api_key
-        # Push keys into env so all downstream modules (validator, memory, healer, hardener)
-        # pick them up via os.getenv. setdefault means .env file values always win.
+        self._openai_api_key = openai_api_key
+        # Push keys into env so all downstream modules (validator, memory, healer, hardener,
+        # openai_validator) pick them up via os.getenv. setdefault means .env always wins.
         if tinyfish_api_key:
             os.environ.setdefault("TINYFISH_API_KEY", tinyfish_api_key)
         if anthropic_api_key:
             os.environ.setdefault("ANTHROPIC_API_KEY", anthropic_api_key)
+        if openai_api_key:
+            os.environ.setdefault("OPENAI_API_KEY", openai_api_key)
 
     @classmethod
     def from_env(cls) -> "GroundWire":
-        """Construct from TINYFISH_API_KEY and ANTHROPIC_API_KEY environment variables."""
+        """Construct from TINYFISH_API_KEY, ANTHROPIC_API_KEY, and OPENAI_API_KEY env vars."""
         return cls(
             tinyfish_api_key=os.getenv("TINYFISH_API_KEY", ""),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         )
 
     def run(

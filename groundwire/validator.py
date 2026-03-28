@@ -49,6 +49,9 @@ IRREVERSIBLE_KEYWORDS = {
 # Keywords that appear in repeated actions when a CAPTCHA/challenge page has stalled the agent.
 # A loop containing any of these is classified as a CAPTCHA stall, not a generic loop.
 # This keeps CAPTCHA escalation (human-in-loop) separate from normal drift (replan).
+# Signals that identify a CAPTCHA/anti-bot stall.
+# All are matched as substrings — keep specific enough to avoid false positives.
+# "bot" removed (substring of "bottom", "robot", etc.); use "bot detected" instead.
 CAPTCHA_SIGNALS = {
     "challenge",
     "verify",
@@ -58,7 +61,7 @@ CAPTCHA_SIGNALS = {
     "recaptcha",
     "hcaptcha",
     "turnstile",
-    "bot",
+    "bot detected",
     "robot",
     "access denied",
     "checking your browser",
@@ -193,6 +196,17 @@ def detect_deterministic_signals(events: list[dict]) -> dict:
                 captcha_detected = True
                 loop_detected = False  # CAPTCHA and loop are mutually exclusive
 
+        # Broader CAPTCHA scan — fires even without a perfect 3-action loop.
+        # Covers varied challenge messages (e.g. "solving captcha", "verifying browser")
+        # that wouldn't form identical consecutive actions but are still CAPTCHA stalls.
+        if not captcha_detected:
+            for e in events[-5:]:
+                step_lower = _event_step_str(e).lower()
+                if any(sig in step_lower for sig in CAPTCHA_SIGNALS):
+                    captcha_detected = True
+                    loop_detected = False  # CAPTCHA takes precedence over generic loop
+                    break
+
         irreversible_detected = False
         irreversible_reason = ""
         for event in events[-3:]:
@@ -205,7 +219,12 @@ def detect_deterministic_signals(events: list[dict]) -> dict:
 
         reasons = []
         if captcha_detected:
-            reasons.append(f"CAPTCHA/challenge stall detected: '{recent_actions[0]}'")
+            _captcha_trigger = next(
+                (_event_step_str(e) for e in events[-5:]
+                 if any(s in _event_step_str(e).lower() for s in CAPTCHA_SIGNALS)),
+                recent_actions[0] if recent_actions else "",
+            )
+            reasons.append(f"CAPTCHA/challenge signal detected: '{_captcha_trigger[:80]}'")
         elif loop_detected:
             reasons.append(f"3 identical consecutive actions: '{recent_actions[0]}'")
         if irreversible_reason:
