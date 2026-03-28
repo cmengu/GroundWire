@@ -8,7 +8,18 @@
 
 ## The 60-second pitch
 
-Every web agent deployment hits the same wall. It works in the demo. In production, it silently stalls on a cookie modal, drifts toward the wrong goal, gets blocked by Cloudflare, or hands back a result with PII baked in. You have no idea it happened.
+**Web agents fail silently in production. Here's how:**
+
+| The failure | What actually happens | How GroundWire stops it |
+|---|---|---|
+| Stalls on a cookie modal | Agent loops on the same page forever, returns nothing | **Self-Healing** generates a hypothesis, tests it in a sandbox, and replans with a confirmed fix |
+| Drifts toward the wrong goal | Agent wanders off-task — you don't know until you read the output | **Trajectory Validation** scores every 5 steps on a 4-axis rubric and triggers a replan before drift compounds |
+| Blocked by Cloudflare | Agent returns a challenge page as its "result" | **Adversarial Hardening** detects the block, classifies it, and auto-retries on a stealth profile with a US proxy |
+| CAPTCHA loop | Agent retries the same challenge page 50 times | **CAPTCHA Escalation** closes the stream immediately and routes to human review — never a replan loop |
+| PII in the output | Agent returns emails and phone numbers in the result string | **Guardrails** scrub the output before it ever reaches your code |
+| Zero visibility | You have no idea any of the above happened | **Memory + Evals** log every quirk, every run, every score — and share them across all your agents |
+
+**You have no idea any of this happened — until GroundWire.**
 
 GroundWire is the layer that goes between your code and TinyFish. It taps into the live SSE event stream, fires seven features automatically on every run, and makes agents actually trustworthy at scale.
 
@@ -28,51 +39,122 @@ result = gw.run(url="https://amazon.com", goal="Get price of AirPods Pro")
 
 ```mermaid
 flowchart TD
-    A([Your Code]) --> B
+    A([Your Code]):::input --> B
 
     subgraph GW["  GroundWire.run()  "]
         direction TB
-        B["① Cross-Agent Memory Recall
-        local JSON + Supabase briefing
-        injected into TinyFish goal"]
-        B --> C["② Guardrails Pre-Check
-        DomainAllowlist · PIIScrubber · ActionBudget
-        fails fast — zero API cost on block"]
+        B["① Cross-Agent Memory Recall\nlocal JSON + Supabase briefing\ninjected into TinyFish goal"]:::memory
+        B --> C["② Guardrails Pre-Check\nDomainAllowlist · PIIScrubber · ActionBudget\nfails fast — zero API cost on block"]:::guard
         C --> TF
 
-        subgraph TF["  TinyFish SSE Stream — every PROGRESS event  "]
+        subgraph TF["  🔴 TinyFish SSE Stream — every PROGRESS event  "]
             direction TB
-            V["③ Trajectory Validation
-            GPT-4o 4-axis rubric
-            goal_alignment · action_efficiency · risk_signal
-            + GPT-4o dual gate when score < 0.70"]
-            V -->|CAPTCHA loop detected| CA["④ CAPTCHA Escalation
-            human-in-loop · resp.close()
-            partial memory write · returns immediately"]
-            V -->|drift streak confirmed| SH["⑤ Self-Healing
-            GPT-4o mini hypothesis
-            → TinyFish sync sandbox
-            → commit + replan with confirmed fix"]
+            V["③ ★ Trajectory Validation\nGPT-4o 4-axis rubric\ngoal_alignment · action_efficiency · risk_signal\n+ dual-model gate when score < 0.70"]:::critical
+            V -->|CAPTCHA loop detected| CA["④ CAPTCHA Escalation\nhuman-in-loop · resp.close()\npartial memory write · returns immediately"]:::captcha
+            V -->|drift streak confirmed| SH["⑤ ★ Self-Healing\nGPT-4o mini hypothesis\n→ TinyFish sync sandbox\n→ commit + replan with confirmed fix"]:::heal
         end
 
-        TF --> AH["⑥ Adversarial Hardening
-        zero-LLM keyword scan
-        GPT-4o mini block classification
-        stealth profile + proxy auto-retry"]
-        AH --> MW["⑦ Memory Write + Cross-Agent Sync
-        extract_quirks → confidence write
-        → Supabase promotion → run_episodes log"]
+        TF --> AH["⑥ ★ Adversarial Hardening\nzero-LLM keyword scan\nGPT-4o mini block classification\nstealth profile + proxy auto-retry"]:::harden
+        AH --> MW["⑦ Memory Write + Cross-Agent Sync\nextract_quirks → confidence write\n→ Supabase promotion → run_episodes log"]:::memory
     end
 
-    MW --> R([Result Events + groundwire_meta])
-    R --> E["Evals · faithfulness · pass@k"]
+    MW --> R([Result Events + groundwire_meta]):::output
+    R --> E["Evals · faithfulness · pass@k"]:::eval
+
+    classDef input fill:#6366f1,stroke:#4338ca,color:#fff
+    classDef memory fill:#8b5cf6,stroke:#7c3aed,color:#fff
+    classDef guard fill:#f59e0b,stroke:#d97706,color:#111
+    classDef critical fill:#ef4444,stroke:#991b1b,color:#fff
+    classDef captcha fill:#f97316,stroke:#c2410c,color:#fff
+    classDef heal fill:#10b981,stroke:#065f46,color:#fff
+    classDef harden fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    classDef output fill:#06b6d4,stroke:#0e7490,color:#fff
+    classDef eval fill:#64748b,stroke:#334155,color:#fff
 ```
+
+**★ = the three features that prevent silent production failures**
 
 ---
 
 ## The seven features
 
-### ① Cross-Agent Memory Recall
+---
+
+> [!IMPORTANT]
+> ### 🔴 ③ Trajectory Validation — *The live brain. Catches drift before it compounds.*
+>
+> *"Is the agent actually heading toward the goal — or wandering?"*
+>
+> Every 5 PROGRESS events, GroundWire scores the live SSE trajectory on four axes:
+>
+> | Axis | Weight | Meaning |
+> |---|---|---|
+> | `goal_alignment` | 0.50 | Is the agent heading toward the actual goal? |
+> | `action_efficiency` | 0.30 | Is it taking the efficient path? |
+> | `risk_signal` | 0.20 | Is it approaching dangerous actions? |
+> | **`progress_rate`** | computed | Weighted composite — the gate metric |
+>
+> When `progress_rate < 0.60` on 2 consecutive checkpoints: **drift confirmed → replan**.
+>
+> **Dual-model gate:** when GPT-4o's primary score drops below `0.70`, a second GPT-4o call scores the same trajectory independently as a cross-check. The more conservative score wins.
+>
+> ```
+> [validator] step  10 | progress=0.64 | align=0.71 | eff=0.55 | risk=0.22
+> [openai]  GPT-4o check: 0.61 | Primary: 0.64 | Using conservative: 0.61
+> [validator] ✗  Drift confirmed — generating Reflexion critique
+> ```
+>
+> Replan injects a **checkpoint context**: how many steps completed + don't restart from zero.
+
+---
+
+> [!IMPORTANT]
+> ### 🟢 ⑤ Self-Healing — *Hypothesis → sandbox → confirmed fix. Not a guess.*
+>
+> *"The agent stalled on a cookie modal. We proved the fix before replanning."*
+>
+> When drift is confirmed, before replanning, GroundWire runs a three-stage cycle using `healer.py`:
+>
+> 1. **Hypothesise** (GPT-4o mini) — generates a site-behaviour explanation for the stall
+>    *"Cookie modal blocks the pricing section on first visit."*
+>
+> 2. **Sandbox** — fires a real TinyFish sync run (`POST /v1/automation/run`) with the hypothesis prefix injected into the goal. 90s timeout.
+>
+> 3. **Commit** — if sandbox status is `COMPLETED`: bumps confidence on the local quirk (`+0.15`) and prepends `CONFIRMED FIX: Accept the cookie modal first.` to `state.replan_goal`.
+>
+> The replanned run starts with **verified site knowledge**, not just a compressed guess.
+>
+> ```
+> [healer] Firing hypothesis sandbox for stripe.com...
+> [healer] ✓ Confirmed: Cookie modal blocks pricing section on first visit
+> [validator] Compressed replanned goal: CONFIRMED FIX: Accept the cookie modal...
+> ```
+>
+> Max 2 hypothesis attempts per drift event. Gracefully returns `{"healed": False}` when no API key is set or sandbox fails — never blocks the replan.
+
+---
+
+> [!IMPORTANT]
+> ### 🔵 ⑥ Adversarial Hardening — *Post-stream block detection and auto-retry. The site fights back — GroundWire wins.*
+>
+> *"The agent hit a Cloudflare wall. We classified it, swapped profiles, and retried — automatically."*
+>
+> After the SSE stream completes, `hardener.py` runs a zero-LLM keyword scan on the full event list and COMPLETE payload. If blocked:
+>
+> 1. **Classify** (GPT-4o mini) → `block_type`: `cloudflare | datadome | captcha | geo_block | rate_limit | login_wall | unknown`
+> 2. **Decide**: `escalate_to_human: true` for hard blocks → human review. False → auto-retry.
+> 3. **Retry** → re-fires TinyFish with `browser_profile: "stealth"` + optional `proxy_config: {country: "US"}` residential proxy
+> 4. **Replace** → if retry succeeds, `state.events` is replaced with the clean retry events before memory write
+> 5. **Log** → `record_antibot_event()` + `record_resolution()` written to Supabase `antibot_events` table for cross-agent pattern sharing
+>
+> ```
+> [hardener] 🛡  Block detected — attempting auto-harden and retry for stripe.com
+> [hardener] ✓ Auto-recovered from cloudflare block (stealth profile, US proxy)
+> ```
+
+---
+
+### 🟣 ① Cross-Agent Memory Recall
 *Network-effect site intelligence. Every agent makes the next one smarter.*
 
 Before firing TinyFish, GroundWire pulls two briefings and merges them into the goal:
@@ -91,8 +173,8 @@ Run 1: 11 steps. Run 2 (warm): **6 steps**. Same goal, 45% less navigation.
 
 ---
 
-### ② Guardrails
-*Composable rules that run before and after execution. Fail fast.*
+### 🟡 ② Guardrails
+*Composable rules that run before and after execution. Fail fast — zero wasted API spend.*
 
 | Rule | When | What |
 |---|---|---|
@@ -109,33 +191,7 @@ Guardrails compose via `GuardrailStack([DomainAllowlist(...), PIIScrubber(), Act
 
 ---
 
-### ③ Trajectory Validation
-*Live mid-run scoring on the TinyFish SSE stream. Drift caught before it compounds.*
-
-Every 5 PROGRESS events, GroundWire scores the trajectory on four axes:
-
-| Axis | Weight | Meaning |
-|---|---|---|
-| `goal_alignment` | 0.50 | Is the agent heading toward the actual goal? |
-| `action_efficiency` | 0.30 | Is it taking the efficient path? |
-| `risk_signal` | 0.20 | Is it approaching dangerous actions? |
-| **`progress_rate`** | computed | Weighted composite — the gate metric |
-
-When `progress_rate < 0.60` on 2 consecutive checkpoints: **drift confirmed → replan**.
-
-**Dual-model gate:** when GPT-4o's primary score drops below `0.70`, a second GPT-4o call scores the same trajectory independently as a cross-check. The more conservative score wins.
-
-```
-[validator] step  10 | progress=0.64 | align=0.71 | eff=0.55 | risk=0.22
-[openai]  GPT-4o check: 0.61 | Primary: 0.64 | Using conservative: 0.61
-[validator] ✗  Drift confirmed — generating Reflexion critique
-```
-
-Replan injects a **checkpoint context**: how many steps completed + don't restart from zero.
-
----
-
-### ④ CAPTCHA Escalation
+### 🟠 ④ CAPTCHA Escalation
 *Separate from drift. Routes to human, not into an infinite replan cycle.*
 
 `detect_deterministic_signals()` returns `captcha_detected: True` (not `loop: True`) when 3 identical consecutive actions contain CAPTCHA keywords (`cloudflare`, `challenge`, `verify`, `datadome`, `turnstile`, `hcaptcha`…).
@@ -149,49 +205,7 @@ The SSE connection closes immediately. Partial memory is written. The caller get
 
 ---
 
-### ⑤ Self-Healing
-*Hypothesis → TinyFish sandbox → Commit. Confirmed fixes go into the replanned goal.*
-
-When drift is confirmed, before replanning, GroundWire runs a three-stage cycle using `healer.py`:
-
-1. **Hypothesise** (GPT-4o mini) — generates a site-behaviour explanation for the stall  
-   *"Cookie modal blocks the pricing section on first visit."*
-
-2. **Sandbox** — fires a real TinyFish sync run (`POST /v1/automation/run`) with the hypothesis prefix injected into the goal. 90s timeout.
-
-3. **Commit** — if sandbox status is `COMPLETED`: bumps confidence on the local quirk (`+0.15`) and prepends `CONFIRMED FIX: Accept the cookie modal first.` to `state.replan_goal`.
-
-The replanned run starts with **verified site knowledge**, not just a compressed guess.
-
-```
-[healer] Firing hypothesis sandbox for stripe.com...
-[healer] ✓ Confirmed: Cookie modal blocks pricing section on first visit
-[validator] Compressed replanned goal: CONFIRMED FIX: Accept the cookie modal...
-```
-
-Max 2 hypothesis attempts per drift event. Gracefully returns `{"healed": False}` when no API key is set or sandbox fails — never blocks the replan.
-
----
-
-### ⑥ Adversarial Hardening
-*Post-stream block detection, GPT-4o mini classification, and escalated auto-retry.*
-
-After the SSE stream completes, `hardener.py` runs a zero-LLM keyword scan on the full event list and COMPLETE payload. If blocked:
-
-1. **Classify** (GPT-4o mini) → `block_type`: `cloudflare | datadome | captcha | geo_block | rate_limit | login_wall | unknown`
-2. **Decide**: `escalate_to_human: true` for hard blocks → human review. False → auto-retry.
-3. **Retry** → re-fires TinyFish with `browser_profile: "stealth"` + optional `proxy_config: {country: "US"}` residential proxy
-4. **Replace** → if retry succeeds, `state.events` is replaced with the clean retry events before memory write
-5. **Log** → `record_antibot_event()` + `record_resolution()` written to Supabase `antibot_events` table for cross-agent pattern sharing
-
-```
-[hardener] 🛡  Block detected — attempting auto-harden and retry for stripe.com
-[hardener] ✓ Auto-recovered from cloudflare block (stealth profile, US proxy)
-```
-
----
-
-### ⑦ Memory Write + Cross-Agent Sync
+### 🩵 ⑦ Memory Write + Cross-Agent Sync
 *Every run teaches the system. Confirmed quirks promoted to the shared network.*
 
 Post-stream (using clean events — retry events if hardener recovered):
@@ -289,7 +303,7 @@ pip install -r requirements.txt
 **`.env` (required):**
 ```
 TINYFISH_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
 ```
 
 **`.env` (optional — enables cross-agent shared memory):**
