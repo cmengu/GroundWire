@@ -23,7 +23,7 @@ def llm_call_with_retry(fn: Callable[[], R], max_attempts: int = 3) -> R:
     for attempt in range(max_attempts):
         try:
             return fn()
-        except anthropic.RateLimitError as e:
+        except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
             last_exc = e
             if attempt == max_attempts - 1:
                 raise

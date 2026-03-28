@@ -10,6 +10,7 @@ Public interface:
 
 PIIScrubber._PATTERNS is a class-level constant imported by memory.py and evals.py.
 """
+import logging
 import re
 from urllib.parse import urlparse
 
@@ -46,7 +47,7 @@ class PIIScrubber:
     """
 
     _PATTERNS: dict[str, str] = {
-        "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+        "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         "phone": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
     }
 
@@ -62,7 +63,7 @@ class PIIScrubber:
                 matches = re.findall(pattern, text)
                 for match in matches:
                     text = text.replace(match, f"[{pii_type.upper()}_REDACTED]")
-                    print(f"[guardrails] Redacted {pii_type}: {match[:6]}***")
+                    logging.debug("[guardrails] Redacted %s", pii_type)
         except Exception:
             pass
         return text

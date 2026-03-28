@@ -25,6 +25,7 @@ Usage:
 """
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from rich import print as rprint
@@ -38,6 +39,26 @@ load_dotenv(_here.parent / ".env")
 from core import run as _run, run_naked
 from evals import SessionRecorder, run_k_trials
 from guardrails import ActionBudget, DomainAllowlist, GuardrailStack, PIIScrubber
+from memory import memory_report
+
+
+def _sparkline(values: list) -> str:
+    """Render floats as unicode block steps; non-float entries (e.g. REPLAN) as ↺."""
+    bars = "▁▂▃▄▅▆▇█"
+    parts = []
+    floats = [v for v in values if isinstance(v, float)]
+    if not floats:
+        return ""
+    lo, hi = min(floats), max(floats)
+    span = hi - lo if hi != lo else 1.0
+    for v in values:
+        if isinstance(v, float):
+            idx = int((v - lo) / span * (len(bars) - 1))
+            parts.append(bars[idx])
+        else:
+            parts.append("↺")
+    return "".join(parts)
+
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -125,33 +146,98 @@ rprint("[dim]First run primes memory. Validator fires every 5 events. Score curv
 recorder = SessionRecorder()
 
 if DRY_RUN:
-    rprint("  [dim]--dry-run: synthetic golden session (no TinyFish)[/dim]\n")
-    golden_events = [
-        {"type": "PROGRESS", "purpose": "Navigate to Hacker News"},
-        {"type": "PROGRESS", "purpose": "Read front page"},
-        {"type": "PROGRESS", "purpose": "Extract story #1 with score"},
-        {"type": "PROGRESS", "purpose": "Extract story #2 with score"},
-        {"type": "PROGRESS", "purpose": "Extract story #3 with score"},
-        {"type": "PROGRESS", "purpose": "Extract story #4 with score"},
-        {"type": "PROGRESS", "purpose": "Extract story #5 with score"},
-        {
-            "type": "COMPLETE",
-            "status": "COMPLETED",
-            "result": {
-                "stories": [
-                    {"title": "Story A", "score": 312, "comments": 87},
-                    {"title": "Story B", "score": 201, "comments": 43},
-                ]
-            },
-        },
-        {
-            "type": "groundwire_meta",
-            "score_curve": [0.82, 0.88],
-            "replan_count": 0,
-            "llm_call_count": 5,
-            "spans": [],
-        },
+    rprint("  [dim]--dry-run: synthetic events piped through live validator (no LLM, no TinyFish)[/dim]\n")
+
+    import json as _json
+    import core as _core_mod
+
+    # Run 1 (depth=0): agent stuck in lazy-load loop — never recovers → replan fires at step 10
+    _FAIL_EVENTS = [
+        {"type": "PROGRESS", "purpose": "navigate to Hacker News front page"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [2]
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [3]
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [4] → events[-3:] identical → LOOP step 5
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [7]
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [8]
+        {"type": "PROGRESS", "purpose": "waiting for lazy-load"},   # [9] → events[-3:] identical → LOOP step 10 → REPLAN
     ]
+    # Run 2 (depth=1): replanned goal + memory briefing → agent scrolls, extracts cleanly
+    _SUCCESS_EVENTS = [
+        {"type": "PROGRESS", "purpose": "navigate to Hacker News — scroll to trigger render"},
+        {"type": "PROGRESS", "purpose": "scroll — story list appeared"},
+        {"type": "PROGRESS", "purpose": "extract story #1 title, score, comments"},
+        {"type": "PROGRESS", "purpose": "extract story #2 title, score, comments"},
+        {"type": "PROGRESS", "purpose": "extract story #3 title, score, comments"},  # step 5 → clean score
+        {"type": "COMPLETE", "status": "COMPLETED",
+         "result": {"stories": [
+             {"title": "Show HN: I built a web agent reliability layer", "score": 312, "comments": 87},
+             {"title": "Ask HN: How do you handle agent drift?",         "score": 201, "comments": 43},
+             {"title": "Groundwire — middleware for trustworthy agents", "score": 178, "comments": 55},
+             {"title": "TinyFish + memory + validator = production ready","score": 134, "comments": 29},
+             {"title": "Pass@k is your reliability floor, not pass@1",   "score": 98,  "comments": 14},
+         ]}},
+    ]
+
+    # Stateful mock: first requests.post call → failing run; second → successful replanned run
+    _post_call_count = [0]
+
+    class _DryRequests:
+        def post(self, *args, **kwargs):
+            _post_call_count[0] += 1
+
+            class _Resp:
+                def raise_for_status(self): pass
+                def iter_lines(self, **kwargs):
+                    src = _FAIL_EVENTS if _post_call_count[0] == 1 else _SUCCESS_EVENTS
+                    for e in src:
+                        yield f"data: {_json.dumps(e)}".encode("utf-8")
+
+            return _Resp()
+
+    _core_mod.requests = _DryRequests()
+
+    # Rubric: bad score for failing run, good score for replanned run. No LLM call.
+    _check_call = [0]
+    def _mock_check(goal, events, intent=""):
+        _check_call[0] += 1
+        if _check_call[0] <= 2:   # checkpoints in the failing run
+            return {"goal_alignment": 0.71, "action_efficiency": 0.55, "risk_signal": 0.22,
+                    "progress_rate": 0.64,
+                    "reason": "Agent stuck in lazy-load wait loop — content never loaded",
+                    "suggestion": "Scroll immediately after navigation to trigger content render"}
+        return {"goal_alignment": 0.93, "action_efficiency": 0.91, "risk_signal": 0.03,  # replanned run
+                "progress_rate": 0.93,
+                "reason": "Scroll strategy working — story list extracted efficiently",
+                "suggestion": ""}
+    _core_mod.check_trajectory = _mock_check
+
+    _intent_call = [0]
+    def _mock_intent(events, domain):
+        _intent_call[0] += 1
+        return ("stuck waiting for lazy-load — content not rendering" if _intent_call[0] <= 2
+                else "extracting story titles, scores, and comment counts")
+    _core_mod.infer_intent = _mock_intent
+
+    _core_mod.generate_critique = lambda goal, events, check, domain="": (
+        "Previous attempt failed because: agent entered a lazy-load wait loop at step 2 "
+        "and never triggered the story list render. "
+        "Avoid: passive waiting after navigation. "
+        "Approach: scroll the page immediately after load — this forces HN's front-page content to render."
+    )
+    _core_mod.compress_goal = lambda goal, briefing, critique: (
+        "OBJECTIVE: Get titles, scores, and comment counts for top 5 HN front page stories\n"
+        "AVOID: Waiting passively after navigation — triggers infinite lazy-load loop\n"
+        "APPROACH: Scroll immediately after page load to force story list render"
+    )
+    _core_mod.extract_quirks = lambda events, domain: [
+        "front page story list requires immediate scroll to render — passive wait loops indefinitely"
+    ]
+    _core_mod.consolidate = lambda domain: False
+
+    golden_events = _run(TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS)
 else:
     golden_events = _run(
         TARGET_URL, GOAL, validate_every=5, guardrails=GUARDRAILS
@@ -164,13 +250,21 @@ golden_steps = len([e for e in golden_events if e.get("type") not in ("groundwir
 golden_curve = golden_meta.get("score_curve", [])
 golden_llm_calls = golden_meta.get("llm_call_count", 0)
 
-curve_str = " ".join(f"{s:.2f}" if isinstance(s, float) else str(s) for s in golden_curve)
+curve_str = (
+    f"{_sparkline(golden_curve)}  "
+    f"{' '.join(f'{s:.2f}' if isinstance(s, float) else str(s) for s in golden_curve)}"
+)
 
 rprint(f"\n[green]✓ Golden session recorded[/green]")
 rprint(f"  Steps:        [bold]{golden_steps}[/bold]  (vs naked: [bold]{naked_steps}[/bold] — memory saves {max(0, naked_steps - golden_steps)} steps)")
 rprint(f"  Score curve:  [{curve_str}]")
 rprint(f"  LLM calls:    {golden_llm_calls}  (validator + quirk extraction + consolidation)")
 rprint(f"  Session ID:   {GOLDEN_SESSION}\n")
+
+_report = memory_report(urlparse(TARGET_URL).netloc)
+if _report:
+    rprint("\n[dim]What Groundwire learned from this run:[/dim]")
+    rprint(f"[dim]{_report}[/dim]\n")
 
 # ── Runs 2–4 — Scored trials (memory active, guardrails enforced) ──────────────
 rprint(Rule())

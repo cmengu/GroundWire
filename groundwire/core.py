@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from guardrails import GuardrailStack, _noop_stack
 from memory import consolidate, extract_quirks, log_run, recall, write
+from openai_validator import DUAL_VALIDATE_THRESHOLD, dual_validate
 from validator import (
     DRIFT_STREAK_REQUIRED,
     DRIFT_THRESHOLD,
@@ -111,6 +112,7 @@ def run(
     _run_id: Optional[str] = None,
     _spans: Optional[list] = None,
     _llm_call_count: int = 0,
+    _is_trial: bool = False,
 ) -> list[dict]:
     """
     Memory recall → TinyFish stream with live validation (Phase 2) → memory write → log → consolidate.
@@ -202,7 +204,11 @@ def run(
                 print(f"[validator] Intent: {intent}")
 
             _llm_call_count += 1
-            check = check_trajectory(goal, events)
+            check = check_trajectory(goal, events, intent=intent)
+            if check["progress_rate"] < DUAL_VALIDATE_THRESHOLD:
+                check["progress_rate"] = dual_validate(
+                    goal, events, check["progress_rate"], intent=intent
+                )
             score_curve.append(check["progress_rate"])
             print(
                 f"[validator] step {len(events):>3} | "
@@ -237,7 +243,7 @@ def run(
                     quirks = extract_quirks(events, domain)
                     if quirks:
                         write(domain, quirks)
-                    log_run(domain, goal, events, success=False)
+                    log_run(domain, goal, events, success=False, is_trial=_is_trial)
                     _llm_call_count += 1
                     consolidate(domain)
 
@@ -255,6 +261,7 @@ def run(
                         _run_id=run_id,
                         _spans=spans,
                         _llm_call_count=_llm_call_count,
+                        _is_trial=_is_trial,
                     )
 
                 if drift_streak >= DRIFT_STREAK_REQUIRED and _depth >= MAX_REPLANS:
@@ -277,7 +284,7 @@ def run(
     else:
         print(f"[memory] No new quirks extracted for {domain}")
 
-    log_run(domain, goal, events, success=_infer_run_success(events))
+    log_run(domain, goal, events, success=_infer_run_success(events), is_trial=_is_trial)
     print("[memory] Run logged")
 
     if consolidate(domain):

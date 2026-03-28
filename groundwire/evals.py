@@ -34,6 +34,9 @@ import anthropic
 from core import run as _run_agent
 from memory import atomic_write_json
 
+# One client per process for the LLM judge — matches validator.py singleton pattern.
+_client = anthropic.Anthropic()
+
 EVALS_DIR = Path(".groundwire_evals")
 EVALS_DIR.mkdir(exist_ok=True)
 
@@ -213,8 +216,6 @@ class TrajectoryScorer:
         Returns {"faithfulness": float, "notes": str}.
         Never raises — returns {"faithfulness": 0.0, "notes": "<error>"} on any failure.
         """
-        client = anthropic.Anthropic()
-
         golden_result_str = json.dumps(golden.get("result", {}))[:600]
         new_result_str = json.dumps(new_result)[:600]
         golden_goal = golden.get("goal", "")
@@ -237,7 +238,7 @@ class TrajectoryScorer:
         )
 
         try:
-            msg = client.messages.create(
+            msg = _client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],
@@ -359,7 +360,13 @@ def run_k_trials(
         )
 
         try:
-            events = _run_agent(url, goal, validate_every=validate_every, guardrails=guardrails)
+            events = _run_agent(
+                url,
+                goal,
+                validate_every=validate_every,
+                guardrails=guardrails,
+                _is_trial=True,
+            )
         except Exception as exc:
             events = []
             print(f"[evals] Trial {i} failed to run: {exc}")

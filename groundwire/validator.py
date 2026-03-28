@@ -10,6 +10,7 @@ Key functions:
     compress_goal(original_goal, briefing, critique) -> 2-sentence replan goal
 """
 import json
+import logging
 
 import anthropic
 
@@ -20,6 +21,9 @@ from schemas import (
     IntentPhrase,
     TrajectoryRubric,
 )
+
+# One client per process — stateless, reuses connection pool across validator calls.
+_client = anthropic.Anthropic()
 
 MODEL = "claude-sonnet-4-6"
 
@@ -66,7 +70,7 @@ def _safe_pass_result(reason: str) -> dict:
     }
 
 
-def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
+def check_trajectory(goal: str, events_so_far: list[dict], intent: str = "") -> dict:
     """
     Rubric scoring with adversarial framing. Computes progress_rate locally.
     Never raises — returns safe pass dict on failure.
@@ -76,14 +80,15 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
     if not events_so_far:
         return _safe_pass_result("No events to evaluate")
 
-    client = anthropic.Anthropic()
     recent = events_so_far[-10:]
     steps_summary = json.dumps([_event_step_str(e) for e in recent], indent=2)
+    intent_line = f"Agent's current inferred intent: {intent}\n\n" if intent else ""
 
     prompt = (
         f"You are evaluating a web agent's trajectory.\n"
         f"Goal: {goal}\n"
         f"Last {len(recent)} actions:\n{steps_summary}\n\n"
+        f"{intent_line}"
         "IMPORTANT: Assume the agent has made at least one mistake. "
         "Your job is to find evidence of drift or failure — not to confirm things are going well. "
         "Score conservatively. If in doubt, score lower.\n\n"
@@ -107,7 +112,7 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
 
     try:
         rubric = parse_structured(
-            client,
+            _client,
             model=MODEL,
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
@@ -129,7 +134,8 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
             "reason": rubric.reason,
             "suggestion": rubric.suggestion,
         }
-    except Exception:
+    except Exception as e:
+        logging.warning("[validator] check_trajectory failed: %s", e)
         return _safe_pass_result("Validator call failed — defaulting to pass")
 
 
@@ -174,7 +180,6 @@ def infer_intent(events: list[dict], domain: str) -> str:
     """Rolling 5-event intent phrase. Returns \"\" on failure — never raises."""
     if not events:
         return ""
-    client = anthropic.Anthropic()
     recent = events[-5:]
     steps_summary = json.dumps([_event_step_str(e) for e in recent], indent=2)
     prompt = (
@@ -187,14 +192,15 @@ def infer_intent(events: list[dict], domain: str) -> str:
     )
     try:
         out = parse_structured(
-            client,
+            _client,
             model=MODEL,
             max_tokens=60,
             messages=[{"role": "user", "content": prompt}],
             response_model=IntentPhrase,
         )
         return out.phrase.strip()
-    except Exception:
+    except Exception as e:
+        logging.warning("[validator] infer_intent failed: %s", e)
         return ""
 
 
@@ -209,7 +215,6 @@ def generate_critique(goal: str, events: list[dict], check_result: dict, domain:
     # Enrich diagnosis with rolling intent if domain is provided.
     current_intent = infer_intent(events, domain) if domain else ""
 
-    client = anthropic.Anthropic()
     early, late = events[:5], events[-5:]
     trajectory_summary = json.dumps(
         {
@@ -246,7 +251,7 @@ def generate_critique(goal: str, events: list[dict], check_result: dict, domain:
     )
     try:
         out = parse_structured(
-            client,
+            _client,
             model=MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
@@ -254,7 +259,8 @@ def generate_critique(goal: str, events: list[dict], check_result: dict, domain:
         )
         text = out.critique.strip()
         return text if text else fallback_critique
-    except Exception:
+    except Exception as e:
+        logging.warning("[validator] generate_critique failed: %s", e)
         return fallback_critique
 
 
@@ -266,7 +272,6 @@ def compress_goal(original_goal: str, briefing: str, critique: str) -> str:
     if not original_goal.strip():
         return fallback if fallback else "Complete the user's web task directly and efficiently."
 
-    client = anthropic.Anthropic()
     briefing_section = (
         f"Memory briefing from prior runs:\n{briefing}\n\n" if briefing.strip() else ""
     )
@@ -287,7 +292,7 @@ def compress_goal(original_goal: str, briefing: str, critique: str) -> str:
     )
     try:
         out = parse_structured(
-            client,
+            _client,
             model=MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
@@ -295,5 +300,6 @@ def compress_goal(original_goal: str, briefing: str, critique: str) -> str:
         )
         text = out.goal.strip()
         return text if text else fallback
-    except Exception:
+    except Exception as e:
+        logging.warning("[validator] compress_goal failed: %s", e)
         return fallback
