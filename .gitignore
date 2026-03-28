@@ -1,10 +1,8 @@
 # Environment
 .env
 
-# Claude (ignore local settings; version selected plans)
-.claude/**
-!.claude/plans/
-!.claude/plans/**
+# Claude (local plans, commands, settings)
+.claude/
 
 # Groundwire package
 groundwire/venv/
