@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core import run, run_naked  # noqa: E402
+from client import GroundWire  # noqa: E402
 from guardrails import (  # noqa: E402
     ActionBudget,
     DomainAllowlist,
@@ -30,6 +31,7 @@ from guardrails import (  # noqa: E402
 )
 
 __all__ = [
+    "GroundWire",
     "run",
     "run_naked",
     "GuardrailStack",
