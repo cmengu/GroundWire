@@ -28,7 +28,7 @@ import re
 import time
 from pathlib import Path
 
-from guardrails import PIIScrubber as _PIIScrubberRef
+from guardrails import GuardrailStack, PIIScrubber as _PIIScrubberRef
 
 import anthropic
 from core import run as _run_agent
@@ -340,6 +340,7 @@ def run_k_trials(
     k: int = 3,
     session_id: str | None = None,
     validate_every: int = 5,
+    guardrails: GuardrailStack | None = None,
 ) -> dict:
     """
     Run k independent trials and compute pass@k reliability statistics.
@@ -358,17 +359,23 @@ def run_k_trials(
         )
 
         try:
-            events = _run_agent(url, goal, validate_every=validate_every)
+            events = _run_agent(url, goal, validate_every=validate_every, guardrails=guardrails)
         except Exception as exc:
             events = []
             print(f"[evals] Trial {i} failed to run: {exc}")
 
         recorder.record(trial_id, goal, events)
 
+        trial_meta = _extract_meta(events)
+        trial_score_curve = trial_meta.get("score_curve", [])
+        trial_llm_calls = trial_meta.get("llm_call_count", 0)
+
         trial_result = {
             "trial": i,
             "trial_id": trial_id,
             "steps": len([e for e in events if e.get("type") != "groundwire_meta"]),
+            "score_curve": trial_score_curve,
+            "llm_calls": trial_llm_calls,
         }
 
         if scorer and session_id:
@@ -433,12 +440,19 @@ def run_k_trials(
         delta_str = f"Δdev={traj.get('deviation_delta', '?')}" if traj else ""
         eff = t.get("efficiency")
         eff_str = f"eff={eff:+d}" if eff is not None else ""
+        curve = t.get("score_curve", [])
+        curve_str = " ".join(
+            f"{s:.2f}" if isinstance(s, float) else str(s) for s in curve
+        )
+        llm_calls = t.get("llm_calls", 0)
         print(
             f"  Trial {t['trial']}: {'✅' if t['ci_pass'] else '❌'} | "
             f"faith={t['faithfulness']} | "
             f"steps={t['steps']} | "
             f"{eff_str} {delta_str}"
         )
+        if curve_str:
+            print(f"    Curve: [{curve_str}] | LLM calls: {llm_calls}")
     print(f"{'='*55}\n")
 
     return stats
