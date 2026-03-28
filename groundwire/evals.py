@@ -10,15 +10,18 @@ Storage: .groundwire_evals/<session_id>.json
 
 Session schema:
   {
-    "session_id":   str,
-    "goal":         str,
-    "timestamp":    float,
-    "events":       list[dict],
-    "result":       dict,
-    "step_count":   int,
-    "replan_count": int,
-    "score_curve":  list,
-    "failure_tags": list[str]
+    "session_id":    str,
+    "goal":          str,
+    "timestamp":     float,
+    "run_id":        str | None,       # TinyFish run ID — links to audit log
+    "streaming_url": str | None,       # TinyFish live preview URL (None until SDK wires it into meta)
+    "events":        list[dict],
+    "result":        dict,
+    "step_count":    int,
+    "replan_count":  int,
+    "score_curve":   list,
+    "failure_tags":  list[str],
+    "steps":         list[{"action": str, "timestamp": float|None, "duration": float|None}]
   }
 
 TrajectoryScorer.score() order: _hard_gates → _llm_judge (if gates pass) → _score_trajectory.
@@ -72,6 +75,30 @@ def _extract_result(events: list[dict]) -> dict:
     return {}
 
 
+def _extract_steps(events: list[dict]) -> list[dict]:
+    """
+    Extract a steps array from the raw event list for sequence diffing.
+    Each step is {"action": str, "timestamp": float | None, "duration": float | None}.
+    Source: PROGRESS events. "purpose" field is the action string proxy for TinyFish steps.
+    timestamp and duration are None until the SDK provides native values on events.
+    Returns [] on any error — scorer handles gracefully.
+    """
+    steps = []
+    try:
+        for event in events:
+            if event.get("type") == "groundwire_meta":
+                continue
+            if event.get("type") == "PROGRESS":
+                steps.append({
+                    "action": event.get("purpose", ""),
+                    "timestamp": event.get("timestamp", None),
+                    "duration": event.get("duration", None),
+                })
+    except Exception:
+        pass
+    return steps
+
+
 class SessionRecorder:
     """
     Write-only component of the eval harness.
@@ -103,12 +130,15 @@ class SessionRecorder:
             "session_id": session_id,
             "goal": goal,
             "timestamp": time.time(),
+            "run_id": meta.get("run_id", None),
+            "streaming_url": meta.get("streaming_url", None),
             "events": events,
             "result": result,
             "step_count": len(real_events),
             "replan_count": meta.get("replan_count", 0),
             "score_curve": meta.get("score_curve", []),
             "failure_tags": failure_tags,
+            "steps": _extract_steps(events),
         }
 
         atomic_write_json(_session_path(session_id), data)
@@ -152,6 +182,27 @@ class SessionRecorder:
 _PII_PATTERNS = _PIIScrubberRef._PATTERNS  # single source of truth — guardrails.PIIScrubber
 
 _STEP_BUDGET = 45
+
+
+def _lcs_ratio(seq_a: list[str], seq_b: list[str]) -> float:
+    """
+    Longest-common-subsequence length ratio between two action string sequences.
+    Returns 0.0 if either sequence is empty.
+    Range: 0.0 (completely different paths) to 1.0 (identical paths).
+    O(n*m) — acceptable for ≤45 steps per sequence.
+    """
+    if not seq_a or not seq_b:
+        return 0.0
+    n, m = len(seq_a), len(seq_b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if seq_a[i - 1] == seq_b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    lcs_len = dp[n][m]
+    return round(lcs_len / max(n, m), 3)
 
 
 class TrajectoryScorer:
@@ -252,10 +303,19 @@ class TrajectoryScorer:
         except Exception as exc:
             return {"faithfulness": 0.0, "notes": f"LLM judge failed: {exc}"}
 
-    def _score_trajectory(self, golden: dict, new_score_curve: list, step_count: int) -> dict:
+    def _score_trajectory(
+        self,
+        golden: dict,
+        new_score_curve: list,
+        step_count: int,
+        new_steps: list[dict] | None = None,
+    ) -> dict:
         """
         Pure Python trajectory comparison — zero LLM calls.
-        Compares the new run's score curve against the golden session's score curve.
+        Compares score curves AND step-action sequences between golden and new run.
+
+        sequence_diverged: True when common_action_ratio < 0.5 — same score, different path.
+        common_action_ratio: LCS ratio of action strings (0.0 = different path; 1.0 = identical).
         """
         golden_curve = golden.get("score_curve", [])
         golden_step_count = golden.get("step_count", 0)
@@ -266,12 +326,18 @@ class TrajectoryScorer:
 
         step_delta = step_count - golden_step_count
 
+        golden_actions = [s.get("action", "") for s in golden.get("steps", [])]
+        new_actions = [s.get("action", "") for s in (new_steps or [])]
+        ratio = _lcs_ratio(golden_actions, new_actions)
+
         return {
             "deviation_delta": golden_drift - new_drift,
             "trajectory_improved": (golden_drift - new_drift) > 0,
             "step_delta": step_delta,
             "golden_drift_count": golden_drift,
             "new_drift_count": new_drift,
+            "common_action_ratio": ratio,
+            "sequence_diverged": ratio < 0.5 and bool(golden_actions) and bool(new_actions),
         }
 
     def score(self, session_id: str, new_events: list[dict]) -> dict:
@@ -300,7 +366,10 @@ class TrajectoryScorer:
         else:
             soft = {"faithfulness": 0.0, "notes": f"Hard gate failed: {hard['reason']}"}
 
-        trajectory = self._score_trajectory(golden, new_score_curve, len(real_events))
+        new_steps = _extract_steps(new_events)
+        trajectory = self._score_trajectory(
+            golden, new_score_curve, len(real_events), new_steps=new_steps
+        )
         efficiency = len(real_events) - golden.get("step_count", 0)
 
         recorder = SessionRecorder()
@@ -329,6 +398,8 @@ class TrajectoryScorer:
                 "step_delta": 0,
                 "golden_drift_count": 0,
                 "new_drift_count": 0,
+                "common_action_ratio": 0.0,
+                "sequence_diverged": False,
             },
             "notes": reason,
             "failure_tags": ["missing_golden_session"],

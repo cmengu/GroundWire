@@ -4,7 +4,8 @@ shared_memory.py — Supabase-backed cross-agent memory layer for GroundWire.
 Provides network-effect site intelligence: quirks discovered by any agent
 on any machine are promoted to a shared store once they cross the confidence
 and confirmation thresholds. All functions degrade to safe no-ops when
-SUPABASE_URL / SUPABASE_KEY are absent or the supabase package is not installed.
+SUPABASE_URL / SUPABASE_KEY (or NEXT_PUBLIC_SUPABASE_* fallbacks) are absent,
+or the supabase package is not installed.
 
 Public API
 ----------
@@ -31,8 +32,17 @@ def _client():
     Return a live Supabase client or None.
     Returns None when URL/key unset, supabase not installed, or constructor fails.
     """
-    url = os.getenv("SUPABASE_URL", "").strip()
-    key = os.getenv("SUPABASE_KEY", "").strip()
+    url = (
+        os.getenv("SUPABASE_URL")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+        or ""
+    ).strip()
+    key = (
+        os.getenv("SUPABASE_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY")
+        or ""
+    ).strip()
     if not url or not key:
         return None
     try:
