@@ -35,7 +35,9 @@ from guardrails import GuardrailStack, PIIScrubber as _PIIScrubberRef
 
 import anthropic
 from core import run as _run_agent
+from llm_utils import parse_structured
 from memory import atomic_write_json
+from schemas import FaithfulnessScore
 
 # One client per process for the LLM judge — matches validator.py singleton pattern.
 _client = anthropic.Anthropic()
@@ -289,16 +291,18 @@ class TrajectoryScorer:
         )
 
         try:
-            msg = _client.messages.create(
+            # Use parse_structured (retry + schema validation) — same pattern as every
+            # other LLM call in the codebase. FaithfulnessScore enforces ge=0 le=1.
+            result = parse_structured(
+                _client,
                 model="claude-sonnet-4-6",
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],
+                response_model=FaithfulnessScore,
             )
-            raw = msg.content[0].text.strip()
-            parsed = json.loads(raw)
             return {
-                "faithfulness": round(float(parsed.get("faithfulness", 0.0)), 3),
-                "notes": str(parsed.get("notes", "")),
+                "faithfulness": round(float(result.faithfulness), 3),
+                "notes": str(result.notes),
             }
         except Exception as exc:
             return {"faithfulness": 0.0, "notes": f"LLM judge failed: {exc}"}

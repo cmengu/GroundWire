@@ -219,12 +219,14 @@ def detect_deterministic_signals(events: list[dict]) -> dict:
 
         reasons = []
         if captcha_detected:
-            _captcha_trigger = next(
-                (_event_step_str(e) for e in events[-5:]
-                 if any(s in _event_step_str(e).lower() for s in CAPTCHA_SIGNALS)),
-                recent_actions[0] if recent_actions else "",
-            )
-            reasons.append(f"CAPTCHA/challenge signal detected: '{_captcha_trigger[:80]}'")
+            # Find the first matching event string without calling _event_step_str twice.
+            _captcha_trigger = recent_actions[0] if recent_actions else ""
+            for _e in events[-5:]:
+                _s = _event_step_str(_e)
+                if any(sig in _s.lower() for sig in CAPTCHA_SIGNALS):
+                    _captcha_trigger = _s[:80]
+                    break
+            reasons.append(f"CAPTCHA/challenge signal detected: '{_captcha_trigger}'")
         elif loop_detected:
             reasons.append(f"3 identical consecutive actions: '{recent_actions[0]}'")
         if irreversible_reason:

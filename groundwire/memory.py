@@ -46,10 +46,9 @@ _ANTHROPIC_MODEL = "claude-sonnet-4-6"
 _DECAY_RATE = 0.95
 _SECONDS_PER_DAY = 86400.0
 
-_PII_RE = re.compile(
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|"
-    r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
-)
+# Compiled once at module level — reused on every write() call.
+# Built from PIIScrubber._PATTERNS (single source of truth in guardrails.py).
+_WRITE_PII_RE = re.compile("|".join(_PIIScrubberGuard._PATTERNS.values()))
 
 # Module-level singleton — stateless, thread-safe, one connection pool per process.
 _client = anthropic.Anthropic()
@@ -99,10 +98,6 @@ def _empty_domain_data() -> dict:
         "run_count": 0,
         "last_consolidated": 0.0,
     }
-
-
-def _filter_pii_quirks(quirks: list[str]) -> list[str]:
-    return [q for q in quirks if q and not _PII_RE.search(q)]
 
 
 def recall(domain: str) -> str:
@@ -161,8 +156,7 @@ def write(domain: str, new_quirks: list[str]) -> None:
     Does NOT increment run_count — that is owned by log_run().
     """
     # Defence in depth: strip PII before any quirk reaches disk.
-    _pii_re = re.compile("|".join(_PIIScrubberGuard._PATTERNS.values()))
-    new_quirks = [q for q in list(new_quirks) if q and not _pii_re.search(q)]
+    new_quirks = [q for q in list(new_quirks) if q and not _WRITE_PII_RE.search(q)]
     if not new_quirks:
         return
 
