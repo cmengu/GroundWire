@@ -1,0 +1,13 @@
+# Environment
+.env
+
+# Claude
+.claude/
+
+# Groundwire package
+groundwire/venv/
+groundwire/.groundwire_memory/
+groundwire/.groundwire_evals/
+groundwire/_pkgs/
+groundwire/__pycache__/
+groundwire/demo_output.txt
