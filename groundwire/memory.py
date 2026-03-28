@@ -362,6 +362,95 @@ def consolidate(domain: str) -> bool:
             return False
 
 
+def patch_quirk(domain: str, quirk_text: str, delta: float) -> None:
+    """
+    Increment or decrement confidence on a single existing quirk by `delta`.
+
+    Positive delta (e.g. +0.15) confirms the quirk after a healer sandbox pass.
+    Negative delta (e.g. -0.10) weakens a quirk whose hypothesis was not confirmed.
+    Confidence is clamped to [0.1, 10.0] to prevent runaway values.
+    No-op if the quirk_text is not found — caller must ensure quirk already exists.
+    Never raises.
+    """
+    path = _domain_path(domain)
+    if not path.exists():
+        return
+    try:
+        with _domain_lock(path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return
+            changed = False
+            for q in data.get("quirks", []):
+                if isinstance(q, dict) and q.get("text") == quirk_text:
+                    current = float(q.get("confidence", 1.0))
+                    q["confidence"] = round(max(0.1, min(10.0, current + delta)), 4)
+                    changed = True
+                    break
+            if changed:
+                atomic_write_json(path, data)
+    except Exception:
+        pass  # local memory patch is best-effort; never blocks healer flow
+
+
+def record_antibot_event(domain: str, run_id: str, block_type: str, note: str) -> None:
+    """
+    Append a local antibot event record to the domain memory file.
+
+    Provides offline tracking of block events in addition to the Supabase write
+    in shared_memory.record_antibot_event. Useful for local debugging without
+    Supabase credentials. Never raises.
+    """
+    path = _domain_path(domain)
+    try:
+        with _domain_lock(path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else _empty_domain_data()
+            except (json.JSONDecodeError, OSError):
+                data = _empty_domain_data()
+            antibot_log = data.setdefault("antibot_events", [])
+            antibot_log.append({
+                "run_id": run_id,
+                "block_type": block_type,
+                "note": note,
+                "resolved": None,  # filled in by record_antibot_resolution
+                "ts": time.time(),
+            })
+            atomic_write_json(path, data)
+    except Exception:
+        pass
+
+
+def record_antibot_resolution(domain: str, block_type: str, resolved: bool, config: dict) -> None:
+    """
+    Update the most recent unresolved antibot_event of `block_type` with its outcome.
+
+    `resolved=True` means auto-retry succeeded; `resolved=False` means it failed.
+    `config` contains the retry parameters used (e.g. {"profile": "stealth"}).
+    Never raises.
+    """
+    path = _domain_path(domain)
+    if not path.exists():
+        return
+    try:
+        with _domain_lock(path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return
+            antibot_log = data.get("antibot_events", [])
+            # Update the most recent entry matching block_type that has not been resolved yet.
+            for entry in reversed(antibot_log):
+                if entry.get("block_type") == block_type and entry.get("resolved") is None:
+                    entry["resolved"] = resolved
+                    entry["resolution_config"] = config
+                    break
+            atomic_write_json(path, data)
+    except Exception:
+        pass
+
+
 def memory_report(domain: str) -> str:
     """
     Pretty-print accumulated domain knowledge for demo visibility.
