@@ -1,32 +1,22 @@
 # GroundWire
 
-**The SLA layer for web agents. One import. Zero new infrastructure.**
+**Reliability middleware for web agents. One import. Seven features. Zero new infrastructure required.**
 
-> "TinyFish gives you the agent. GroundWire gives you the SLA."
-
----
-
-## The problem
-
-Spinning up a web agent takes minutes. Getting it to behave consistently across 100 runs is a different problem entirely.
-
-Every production deployment hits the same failure modes:
-- The agent stalls on a Cloudflare challenge and you have no idea
-- It drifts toward checkout when you asked for pricing data — no one catches it
-- A cookie modal on the first visit blocks every run after
-- Another team's agent already solved this site — but yours starts cold every time
-
-These aren't agent problems. They're gaps in the layer *around* the agent. GroundWire closes them.
+> *"TinyFish gives you the agent. GroundWire gives you the SLA."*
 
 ---
 
-## One import. All seven features fire automatically.
+## The 60-second pitch
+
+Every web agent deployment hits the same wall. It works in the demo. In production, it silently stalls on a cookie modal, drifts toward the wrong goal, gets blocked by Cloudflare, or hands back a result with PII baked in. You have no idea it happened.
+
+GroundWire is the layer that goes between your code and TinyFish. It taps into the live SSE event stream, fires seven features automatically on every run, and makes agents actually trustworthy at scale.
 
 ```python
-# Before GroundWire
+# Before
 result = requests.post("https://agent.tinyfish.ai/v1/automation/run-sse", ...)
 
-# After GroundWire — zero other changes
+# After — zero other changes
 from groundwire import GroundWire
 gw = GroundWire.from_env()
 result = gw.run(url="https://amazon.com", goal="Get price of AirPods Pro")
@@ -34,107 +24,165 @@ result = gw.run(url="https://amazon.com", goal="Get price of AirPods Pro")
 
 ---
 
-## What fires on every `gw.run()`
+## Architecture
 
-```
-Your Code
-  └─► GroundWire.run()
-        ├── [1] Cross-agent memory recall        — briefing injected into goal
-        ├── [2] Guardrails pre-check             — domain allowlist, action budget
-        │
-        │   TinyFish SSE stream (live)
-        │     └── [3] Trajectory validation      — every 5 events, Claude scores progress
-        │           ├── [4] CAPTCHA detection    — human escalation, not replan
-        │           └── [5] Self-Healing         — hypothesis → sandbox → confirmed fix
-        │
-        ├── [6] Adversarial hardening            — block scan → Claude classify → stealth retry
-        ├── [7] Memory write + cross-agent sync  — promotes confirmed quirks to Supabase
-        └── Evals / faithfulness scoring
+```mermaid
+flowchart TD
+    A([Your Code]) --> B
+
+    subgraph GW["  GroundWire.run()  "]
+        direction TB
+        B["① Cross-Agent Memory Recall
+        local JSON + Supabase briefing
+        injected into TinyFish goal"]
+        B --> C["② Guardrails Pre-Check
+        DomainAllowlist · PIIScrubber · ActionBudget
+        fails fast — zero API cost on block"]
+        C --> TF
+
+        subgraph TF["  TinyFish SSE Stream — every PROGRESS event  "]
+            direction TB
+            V["③ Trajectory Validation
+            Claude Sonnet 4-axis rubric
+            goal_alignment · action_efficiency · risk_signal
+            + GPT-4o dual gate when score < 0.70"]
+            V -->|CAPTCHA loop detected| CA["④ CAPTCHA Escalation
+            human-in-loop · resp.close()
+            partial memory write · returns immediately"]
+            V -->|drift streak confirmed| SH["⑤ Self-Healing
+            Claude Haiku hypothesis
+            → TinyFish sync sandbox
+            → commit + replan with confirmed fix"]
+        end
+
+        TF --> AH["⑥ Adversarial Hardening
+        zero-LLM keyword scan
+        Claude Haiku block classification
+        stealth profile + proxy auto-retry"]
+        AH --> MW["⑦ Memory Write + Cross-Agent Sync
+        extract_quirks → confidence write
+        → Supabase promotion → run_episodes log"]
+    end
+
+    MW --> R([Result Events + groundwire_meta])
+    R --> E["Evals · faithfulness · pass@k"]
 ```
 
 ---
 
-## Feature deep-dives
+## The seven features
 
-### [1] Cross-Agent Memory Sharing
-*Network effect site intelligence — shared across every GroundWire user.*
+### ① Cross-Agent Memory Recall
+*Network-effect site intelligence. Every agent makes the next one smarter.*
 
-After each run, confirmed site quirks (cookie modals, lazy-load timing, auth walls, anti-bot patterns) are promoted to a shared Supabase store when confidence crosses a threshold. Any agent on any machine tackling the same domain gets a pre-briefing:
+Before firing TinyFish, GroundWire pulls two briefings and merges them into the goal:
+
+- **Local memory** (`memory.py`) — per-domain JSON: confidence-weighted quirks, episodic run history, Claude-synthesized semantic profile (every 3 real runs)
+- **Shared memory** (`shared_memory.py`) — Supabase: quirks confirmed by 2+ agents cross-machine, promoted once local confidence crosses `1.5×`
 
 ```
-[memory] SHARED SITE MEMORY (3 agents, 4.2x confidence):
-         policy page uses lazy-loaded section headers — scroll required
-         before section text is accessible
+[memory] Known quirks:
+[memory]   - policy page uses lazy-loaded section headers (confirmed 6.0x)
+           SHARED SITE MEMORY (3 agents, 4.2x confidence): scroll required before
+           section text is accessible
 ```
 
-The first agent on a site pays the cold-start tax. Every agent after gets a head start.
+Run 1: 11 steps. Run 2 (warm): **6 steps**. Same goal, 45% less navigation.
 
 ---
 
-### [2] Guardrails
-*Hard stops that run before the agent touches the page.*
+### ② Guardrails
+*Composable rules that run before and after execution. Fail fast.*
 
-Composable rules checked before every run and post-processed on every output:
-
-| Rule | What it does |
-|---|---|
-| `DomainAllowlist` | Blocks off-target requests before they fire |
-| `PIIScrubber` | Catches emails, phone numbers before results leave the system |
-| `ActionBudget(n)` | Hard-stops runaway agents at step n |
+| Rule | When | What |
+|---|---|---|
+| `DomainAllowlist(["stripe.com"])` | pre-run | Raises before TinyFish fires — zero API cost |
+| `PIIScrubber()` | post-run | Redacts emails, phone numbers from result string |
+| `ActionBudget(50)` | post-run | Hard-stops runaway agents at step N |
 
 ```
-[guardrail] Domain not in allowlist — run blocked.
+[guardrail] Domain 'evil.com' not in allowlist — run blocked.
 [guardrail] Output scrubbed: j.doe@example.com → [EMAIL_REDACTED]
 ```
 
+Guardrails compose via `GuardrailStack([DomainAllowlist(...), PIIScrubber(), ActionBudget(50)])`.
+
 ---
 
-### [3] Trajectory Validation
-*Live mid-run scoring on the TinyFish SSE stream.*
+### ③ Trajectory Validation
+*Live mid-run scoring on the TinyFish SSE stream. Drift caught before it compounds.*
 
-Every 5 PROGRESS events, GroundWire scores the trajectory on four axes: `goal_alignment`, `action_efficiency`, `risk_signal`, `progress_rate`. A dual-model gate (Claude + GPT-4o second opinion) fires when Claude's score drops below threshold.
+Every 5 PROGRESS events, GroundWire scores the trajectory on four axes:
+
+| Axis | Weight | Meaning |
+|---|---|---|
+| `goal_alignment` | 0.50 | Is the agent heading toward the actual goal? |
+| `action_efficiency` | 0.30 | Is it taking the efficient path? |
+| `risk_signal` | 0.20 | Is it approaching dangerous actions? |
+| **`progress_rate`** | computed | Weighted composite — the gate metric |
+
+When `progress_rate < 0.60` on 2 consecutive checkpoints: **drift confirmed → replan**.
+
+**Dual-model gate:** when Claude Sonnet's score drops below `0.70`, GPT-4o scores the same trajectory independently. The more conservative score wins.
 
 ```
 [validator] step  10 | progress=0.64 | align=0.71 | eff=0.55 | risk=0.22
-[validator] ⚠  Drift signal (1/2): agent scrolling without producing output
+[openai]  GPT-4o: 0.61 | Claude: 0.64 | Using conservative: 0.61
 [validator] ✗  Drift confirmed — generating Reflexion critique
 ```
 
-Replan carries forward a checkpoint context: the compressed goal tells the new run exactly how many steps completed and where to resume, not restart.
+Replan injects a **checkpoint context**: how many steps completed + don't restart from zero.
 
 ---
 
-### [4] CAPTCHA Escalation
-*Route to human-in-loop, not into an infinite replan cycle.*
+### ④ CAPTCHA Escalation
+*Separate from drift. Routes to human, not into an infinite replan cycle.*
 
-When `detect_deterministic_signals()` sees 3 identical consecutive actions containing CAPTCHA keywords (`cloudflare`, `challenge`, `verify`, `datadome`...), it sets `captcha_detected: True` instead of `loop: True`. The SSE connection closes immediately, partial memory is written, and a `groundwire_meta` event with `action_required: "human_review"` is returned.
+`detect_deterministic_signals()` returns `captcha_detected: True` (not `loop: True`) when 3 identical consecutive actions contain CAPTCHA keywords (`cloudflare`, `challenge`, `verify`, `datadome`, `turnstile`, `hcaptcha`…).
 
-CAPTCHA stalls no longer trigger replans that hit the same challenge page again.
+The SSE connection closes immediately. Partial memory is written. The caller gets a `groundwire_meta` event with `action_required: "human_review"` — never a replan that hits the same challenge page again.
 
----
-
-### [5] Self-Healing
-*Hypothesis → Sandbox → Commit. Confirmed fixes go into the replanned goal.*
-
-When drift is confirmed, before replanning, GroundWire runs a full hypothesis cycle:
-
-1. **Hypothesise** — Claude Haiku generates a site-behaviour explanation for the stall (e.g. *"cookie modal blocks the pricing section on first visit"*)
-2. **Sandbox** — fires a real TinyFish sync run with the hypothesis prefix injected into the goal
-3. **Commit** — if the sandbox succeeds, bumps local confidence on the quirk and prepends `CONFIRMED FIX: Accept the cookie modal first.` to the replanned goal
-
-The replanned run starts with verified site knowledge, not just a compressed hope.
+```
+[validator] 🔒 CAPTCHA detected — human intervention required:
+            CAPTCHA/challenge stall: 'waiting for cloudflare challenge to resolve'
+```
 
 ---
 
-### [6] Adversarial Hardening
-*Post-stream block detection, Claude classification, and escalated auto-retry.*
+### ⑤ Self-Healing
+*Hypothesis → TinyFish sandbox → Commit. Confirmed fixes go into the replanned goal.*
 
-After the SSE stream completes, a zero-LLM keyword scan checks for block signals in the event list and COMPLETE payload. If blocked:
+When drift is confirmed, before replanning, GroundWire runs a three-stage cycle using `healer.py`:
 
-1. **Classify** — Claude Haiku identifies the block type (`cloudflare`, `datadome`, `captcha`, `geo_block`, `rate_limit`, `login_wall`)
-2. **Decide** — `escalate_to_human: true` for hard blocks; auto-retry for soft ones
-3. **Retry** — re-fires TinyFish with `browser_profile: "stealth"` and optional country-routed residential proxy
-4. **Log** — outcome recorded to Supabase `antibot_events` for cross-agent pattern sharing
+1. **Hypothesise** (Claude Haiku) — generates a site-behaviour explanation for the stall  
+   *"Cookie modal blocks the pricing section on first visit."*
+
+2. **Sandbox** — fires a real TinyFish sync run (`POST /v1/automation/run`) with the hypothesis prefix injected into the goal. 90s timeout.
+
+3. **Commit** — if sandbox status is `COMPLETED`: bumps confidence on the local quirk (`+0.15`) and prepends `CONFIRMED FIX: Accept the cookie modal first.` to `state.replan_goal`.
+
+The replanned run starts with **verified site knowledge**, not just a compressed guess.
+
+```
+[healer] Firing hypothesis sandbox for stripe.com...
+[healer] ✓ Confirmed: Cookie modal blocks pricing section on first visit
+[validator] Compressed replanned goal: CONFIRMED FIX: Accept the cookie modal...
+```
+
+Max 2 hypothesis attempts per drift event. Gracefully returns `{"healed": False}` when no API key is set or sandbox fails — never blocks the replan.
+
+---
+
+### ⑥ Adversarial Hardening
+*Post-stream block detection, Claude Haiku classification, and escalated auto-retry.*
+
+After the SSE stream completes, `hardener.py` runs a zero-LLM keyword scan on the full event list and COMPLETE payload. If blocked:
+
+1. **Classify** (Claude Haiku) → `block_type`: `cloudflare | datadome | captcha | geo_block | rate_limit | login_wall | unknown`
+2. **Decide**: `escalate_to_human: true` for hard blocks → human review. False → auto-retry.
+3. **Retry** → re-fires TinyFish with `browser_profile: "stealth"` + optional `proxy_config: {country: "US"}` residential proxy
+4. **Replace** → if retry succeeds, `state.events` is replaced with the clean retry events before memory write
+5. **Log** → `record_antibot_event()` + `record_resolution()` written to Supabase `antibot_events` table for cross-agent pattern sharing
 
 ```
 [hardener] 🛡  Block detected — attempting auto-harden and retry for stripe.com
@@ -143,38 +191,90 @@ After the SSE stream completes, a zero-LLM keyword scan checks for block signals
 
 ---
 
-### [7] Memory Write + Eval Harness
-*Every run teaches the system. Every replay is graded.*
+### ⑦ Memory Write + Cross-Agent Sync
+*Every run teaches the system. Confirmed quirks promoted to the shared network.*
 
-Post-run: Claude extracts site quirks → confidence-weighted write → Supabase promotion if threshold met → `run_episodes` logged.
+Post-stream (using clean events — retry events if hardener recovered):
 
-Record a golden run once. Replay any time. Get back:
+1. Claude Haiku extracts site quirks from the event trajectory → confidence-weighted upsert to local JSON
+2. `log_run()` appends the episodic record
+3. Every 3rd real run: `consolidate()` synthesizes a one-sentence Claude strategic profile
+4. `_sync_quirks_to_shared()` — promotes quirks where local confidence ≥ 1.5× via Supabase RPC `upsert_quirk` + logs `run_episodes`
+
+Any new agent tackling the same domain gets step ① pre-briefed with this knowledge.
+
+---
+
+## Eval harness
+
+`evals.py` separates recording from scoring:
+
+- **`SessionRecorder`** — write-only, records golden runs to `.groundwire_evals/<session>.json`
+- **`TrajectoryScorer`** — hard gates first (PII, step budget), then Claude Haiku LLM judge, then `faithfulness` score (0–1)
+- **`run_k_trials(k=3)`** — runs N trials, computes `pass@1`, `pass@3`, pass rate, mean faithfulness
 
 ```
-Faithfulness: 0.95 | Steps: 6 vs naked 11 | pass@3: True
+📊 Eval Scorecard — 3 trials
+  pass@1: True  |  pass@3: True  |  Pass rate: 100%  |  Mean faithfulness: 0.95
+  Trial 0: ✅ | faith=0.95 | steps=6 | Curve: [0.91 0.94]
 ```
 
 ---
 
-## Architecture
+## Benchmarks (dry-run, live Claude)
+
+| | Naked TinyFish | With GroundWire |
+|---|---|---|
+| Steps — cold start | 11 | 10 |
+| Steps — warm (memory active) | 11 | **6** |
+| Drift detected | 0/2 | 2/2 |
+| CAPTCHA handled | stalls silently | escalates immediately |
+| Anti-bot block | fails | auto-retries stealth |
+| PII in output | leaked | scrubbed |
+| Cross-agent knowledge | none | Supabase shared |
+| Faithfulness | not measured | **0.95** |
+| pass@3 | — | **100%** |
+
+---
+
+## File-by-file
 
 ```
 groundwire/
-├── client.py         # GroundWire class — public API, SSE orchestration, _on_progress_hook
-├── core.py           # Thin backward-compat shim → client.py
-├── validator.py      # Trajectory rubric + CAPTCHA detection (zero-LLM + Claude)
-├── healer.py         # SelfHealer — Hypothesis → TinyFish sandbox → memory commit
-├── hardener.py       # AdversarialHardener — block scan, Claude classify, stealth retry
-├── memory.py         # Per-domain JSON: confidence quirks, episodic runs, semantic profile
-├── shared_memory.py  # Supabase sync: get_shared_briefing, promote_if_ready, record_episode
-├── schemas.py        # Pydantic DTOs: TrajectoryRubric, HypothesisResult, BlockClassification
-├── guardrails.py     # Composable rules: DomainAllowlist, PIIScrubber, ActionBudget
-├── evals.py          # Golden-run recorder + faithfulness scorer
-├── openai_validator.py # GPT-4o dual-validation gate
-└── demo.py           # End-to-end demo: naked vs GroundWire vs scored trials
+├── client.py           # GroundWire class — public API, SSE orchestration, _on_progress_hook
+│                       # _RunState dataclass (per-run isolated state, concurrent-safe)
+├── core.py             # Thin backward-compat shim → client.py (74 lines)
+├── validator.py        # Trajectory rubric scoring · CAPTCHA/loop detection · Reflexion critique
+│                       # DRIFT_THRESHOLD=0.60 · DRIFT_STREAK_REQUIRED=2 · CAPTCHA_SIGNALS
+├── healer.py           # SelfHealer: Hypothesis → TinyFish sync sandbox → memory commit
+├── hardener.py         # AdversarialHardener: scan → Claude classify → stealth retry → Supabase log
+├── memory.py           # Per-domain JSON: quirks (confidence) + runs + semantic_profile
+│                       # patch_quirk · record_antibot_event · record_antibot_resolution
+├── shared_memory.py    # Supabase: get_shared_briefing · promote_if_ready · record_episode
+│                       # record_antibot_event · record_resolution — all no-op if unconfigured
+├── schemas.py          # Pydantic DTOs: TrajectoryRubric · HypothesisResult · BlockClassification
+├── guardrails.py       # DomainAllowlist · PIIScrubber · ActionBudget · GuardrailStack
+├── evals.py            # SessionRecorder · TrajectoryScorer · run_k_trials · pass@k
+├── openai_validator.py # GPT-4o dual-validation gate (DUAL_VALIDATE_THRESHOLD=0.70)
+├── llm_utils.py        # parse_structured — unified Claude tool-use helper
+├── supabase_schema.sql # domain_quirks · run_episodes · antibot_events DDL
+└── demo.py             # Full pitch script: naked → golden → 3 scored trials → scorecard
 ```
 
-**Stack:** Python · TinyFish Agent API (SSE + sync) · Anthropic Claude (Haiku + Sonnet) · OpenAI GPT-4o · Supabase (pgvector-ready) · Pydantic
+**Models in use:**
+
+| Model | Used for |
+|---|---|
+| `claude-sonnet-4-6` | Trajectory rubric, intent inference, Reflexion critique, goal compression, faithfulness scoring |
+| `claude-haiku-4-5` | Hypothesis generation, block classification, quirk extraction, consolidation |
+| `gpt-4o` | Dual-validation second opinion (when Claude score < 0.70) |
+
+**TinyFish endpoints:**
+
+| Endpoint | Used for |
+|---|---|
+| `POST /v1/automation/run-sse` | All main runs + hardener retry (streaming) |
+| `POST /v1/automation/run` | Healer sandbox (sync — waits for COMPLETED status) |
 
 ---
 
@@ -187,56 +287,47 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Required — `.env`:**
+**`.env` (required):**
 ```
 TINYFISH_API_KEY=your_key_here
 ANTHROPIC_API_KEY=your_key_here
 ```
 
-**Optional — enable cross-agent shared memory (Supabase):**
+**`.env` (optional — enables cross-agent shared memory):**
 ```
-NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=your_supabase_anon_key_here
+NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=your_anon_key
 ```
-> Run `groundwire/supabase_schema.sql` once in the Supabase SQL editor to create the `domain_quirks`, `run_episodes`, and `antibot_events` tables.
+Run `supabase_schema.sql` once in the Supabase SQL editor to create the three tables.
 
-**Run the demo (dry-run — no TinyFish credits used):**
+**Dry-run (no API keys or credits needed):**
 ```bash
 python demo.py --dry-run
 ```
 
-**Run live:**
+**Live demo:**
 ```bash
 python demo.py
 ```
 
----
-
-## Benchmark
-
-| | Raw TinyFish | With GroundWire |
-|---|---|---|
-| Steps taken (cold start) | 11 | 10 |
-| Steps taken (warm — memory active) | 11 | **6** |
-| Trajectory deviations | 2 (undetected) | 1 (caught at step 9, replanned) |
-| CAPTCHA handling | stalls silently | escalates to human immediately |
-| Block recovery | fails | auto-retries with stealth profile |
-| PII in output | leaked | redacted |
-| Cross-agent knowledge | none | shared via Supabase |
-| Eval faithfulness | not measured | **0.95** |
-| pass@3 | — | **100%** |
+**Flags:**
+```bash
+python demo.py --skip-naked          # skip naked baseline, run golden + trials
+python demo.py --trials-only         # only run scored trials (needs saved session)
+python demo.py --dry-run             # synthetic events, live Claude scoring
+```
 
 ---
 
-## What judges are actually looking at
+## Why this isn't a demo toy
 
-**Technical Complexity** — CAPTCHA detection that's mutually exclusive with loop detection (not conflated). Healer runs a real TinyFish sandbox to confirm a hypothesis before committing anything to memory. Adversarial hardening classifies, retries with escalated browser profile + proxy, and logs the outcome to shared Supabase for every future agent.
+Every feature degrades gracefully when dependencies are absent:
+- No Supabase credentials → shared memory silently no-ops
+- No OpenAI key → dual-validation skipped, Claude score used
+- No TinyFish key → healer sandbox returns `{"healed": False}` immediately
+- Hardener retry with stealth profile fails → original events used for memory write
 
-**Tool Integration** — TinyFish SSE stream is the interception surface for all validation and healing. Sync endpoint powers the healer sandbox. Stealth browser profile + proxy routing power the hardener retry. Claude Haiku handles hypothesis generation and block classification. Claude Sonnet scores trajectory rubrics. GPT-4o provides a second opinion when Claude's confidence is low.
-
-**Utility & Impact** — Every agent deployment is currently a fresh roll of the dice. GroundWire turns site knowledge into a compounding asset that gets shared across teams. A cookie modal discovered by one agent is never discovered again by any agent.
-
-**Innovation** — Self-healing that tests its own hypothesis before committing. Cross-agent memory that creates a network effect from individual agent runs. CAPTCHA escalation that knows the difference between a stall and a loop. All behind a single method call.
+The system **never crashes** on missing optional dependencies. You get the features you've configured, plus a working agent run regardless.
 
 ---
 
