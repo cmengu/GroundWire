@@ -11,9 +11,17 @@ Key functions:
 """
 import json
 
-import anthropic as _anthropic
+import anthropic
 
-MODEL = "claude-sonnet-4-20250514"
+from llm_utils import parse_structured
+from schemas import (
+    CompressedGoal,
+    CritiqueText,
+    IntentPhrase,
+    TrajectoryRubric,
+)
+
+MODEL = "claude-sonnet-4-6"
 
 PROGRESS_WEIGHTS = {
     "goal_alignment": 0.50,
@@ -68,7 +76,7 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
     if not events_so_far:
         return _safe_pass_result("No events to evaluate")
 
-    client = _anthropic.Anthropic()
+    client = anthropic.Anthropic()
     recent = events_so_far[-10:]
     steps_summary = json.dumps([_event_step_str(e) for e in recent], indent=2)
 
@@ -92,27 +100,22 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
         "  0.0 = clean navigation, no blockers\n"
         "  0.5 = possible auth wall or redirect detected\n"
         "  1.0 = confirmed blocker: login wall, CAPTCHA, dead end\n\n"
-        "Respond ONLY in JSON. No preamble. No markdown. No explanation outside the JSON.\n"
-        "{\n"
-        '  "goal_alignment":    <float 0.0–1.0>,\n'
-        '  "action_efficiency": <float 0.0–1.0>,\n'
-        '  "risk_signal":       <float 0.0–1.0>,\n'
-        '  "reason":            "<one sentence: what evidence of failure you observe>",\n'
-        '  "suggestion":        "<one sentence: concrete corrective action>"\n'
-        "}"
+        "Respond with JSON only (no markdown) matching this shape:\n"
+        '{"goal_alignment": float, "action_efficiency": float, "risk_signal": float, '
+        '"reason": "<one sentence>", "suggestion": "<one sentence>"}'
     )
 
     try:
-        msg = client.messages.create(
+        rubric = parse_structured(
+            client,
             model=MODEL,
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
+            response_model=TrajectoryRubric,
         )
-        raw = msg.content[0].text.strip()
-        parsed = json.loads(raw)
-        ga = float(parsed.get("goal_alignment", 0.5))
-        ae = float(parsed.get("action_efficiency", 0.5))
-        rs = float(parsed.get("risk_signal", 0.0))
+        ga = float(rubric.goal_alignment)
+        ae = float(rubric.action_efficiency)
+        rs = float(rubric.risk_signal)
         progress_rate = (
             PROGRESS_WEIGHTS["goal_alignment"] * ga
             + PROGRESS_WEIGHTS["action_efficiency"] * ae
@@ -123,8 +126,8 @@ def check_trajectory(goal: str, events_so_far: list[dict]) -> dict:
             "action_efficiency": round(ae, 3),
             "risk_signal": round(rs, 3),
             "progress_rate": round(progress_rate, 3),
-            "reason": str(parsed.get("reason", "")),
-            "suggestion": str(parsed.get("suggestion", "")),
+            "reason": rubric.reason,
+            "suggestion": rubric.suggestion,
         }
     except Exception:
         return _safe_pass_result("Validator call failed — defaulting to pass")
@@ -171,7 +174,7 @@ def infer_intent(events: list[dict], domain: str) -> str:
     """Rolling 5-event intent phrase. Returns \"\" on failure — never raises."""
     if not events:
         return ""
-    client = _anthropic.Anthropic()
+    client = anthropic.Anthropic()
     recent = events[-5:]
     steps_summary = json.dumps([_event_step_str(e) for e in recent], indent=2)
     prompt = (
@@ -180,27 +183,33 @@ def infer_intent(events: list[dict], domain: str) -> str:
         "In 3–7 words, what is the agent currently trying to do?\n"
         "Examples: 'navigating to pricing section', 'dismissing cookie modal', "
         "'stuck in authentication loop', 'extracting plan feature list'\n"
-        "Return ONLY the short phrase. No punctuation at the end. No preamble."
+        "Return JSON only: {\"phrase\": \"<short phrase, no trailing punctuation>\"}"
     )
     try:
-        msg = client.messages.create(
+        out = parse_structured(
+            client,
             model=MODEL,
-            max_tokens=30,
+            max_tokens=60,
             messages=[{"role": "user", "content": prompt}],
+            response_model=IntentPhrase,
         )
-        return msg.content[0].text.strip()
+        return out.phrase.strip()
     except Exception:
         return ""
 
 
-def generate_critique(goal: str, events: list[dict], check_result: dict) -> str:
+def generate_critique(goal: str, events: list[dict], check_result: dict, domain: str = "") -> str:
     """
     Reflexion-style critique for replan. Never raises; always non-empty str.
+    Optionally accepts domain to enrich diagnosis with inferred intent.
     """
     if not events:
         return f"Previous attempt had no recorded actions. Retry goal: {goal}"
 
-    client = _anthropic.Anthropic()
+    # Enrich diagnosis with rolling intent if domain is provided.
+    current_intent = infer_intent(events, domain) if domain else ""
+
+    client = anthropic.Anthropic()
     early, late = events[:5], events[-5:]
     trajectory_summary = json.dumps(
         {
@@ -216,30 +225,35 @@ def generate_critique(goal: str, events: list[dict], check_result: dict) -> str:
         f"risk_signal={check_result.get('risk_signal', '?')}, "
         f"progress_rate={check_result.get('progress_rate', '?')}"
     )
+    intent_line = f"Agent's last inferred intent: {current_intent}\n" if current_intent else ""
     prompt = (
         f"A web agent failed to complete this goal: {goal}\n\n"
         f"Trajectory summary:\n{trajectory_summary}\n\n"
         f"Evaluation scores: {diagnosis}\n"
-        f"Validator diagnosis: {check_result.get('reason', 'unknown')}\n\n"
+        f"Validator diagnosis: {check_result.get('reason', 'unknown')}\n"
+        f"{intent_line}\n"
         "Write a short Reflexion critique (2–3 sentences) for the replanned attempt:\n"
         "1. What went wrong (specific — name the page, action, or pattern)\n"
         "2. What the next attempt should explicitly avoid\n"
         "3. One concrete alternative strategy to try\n\n"
         "Format: Start with 'Previous attempt failed because:' and write in plain English.\n"
-        "Do not use bullet points. Do not use markdown. Max 60 words."
+        "Do not use bullet points. Do not use markdown. Max 60 words.\n"
+        'Return JSON only: {"critique": "<your critique text>"}'
     )
     fallback_critique = (
         f"Previous attempt failed because: {check_result.get('reason', 'trajectory deviated from goal')}. "
         f"Avoid: {check_result.get('suggestion', 'repeating the same navigation path')}."
     )
     try:
-        msg = client.messages.create(
+        out = parse_structured(
+            client,
             model=MODEL,
-            max_tokens=150,
+            max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
+            response_model=CritiqueText,
         )
-        raw = msg.content[0].text.strip()
-        return raw if raw else fallback_critique
+        text = out.critique.strip()
+        return text if text else fallback_critique
     except Exception:
         return fallback_critique
 
@@ -252,32 +266,34 @@ def compress_goal(original_goal: str, briefing: str, critique: str) -> str:
     if not original_goal.strip():
         return fallback if fallback else "Complete the user's web task directly and efficiently."
 
-    client = _anthropic.Anthropic()
+    client = anthropic.Anthropic()
     briefing_section = (
         f"Memory briefing from prior runs:\n{briefing}\n\n" if briefing.strip() else ""
     )
     prompt = (
-        f"You are preparing a clean goal for a web agent's retry attempt.\n\n"
+        f"You are preparing a structured goal for a web agent's retry attempt.\n\n"
         f"Original goal:\n{original_goal}\n\n"
         f"{briefing_section}"
         f"Reflexion critique (what went wrong and what to avoid):\n{critique}\n\n"
-        "Write a single clean goal for the retry attempt in exactly 2 sentences:\n"
-        "Sentence 1: The specific objective (what to find or accomplish).\n"
-        "Sentence 2: The key constraint or strategy from the critique (what to do differently).\n\n"
+        "Write a structured goal using exactly these three labeled lines:\n"
+        "OBJECTIVE: [the specific task to accomplish, max 20 words]\n"
+        "AVOID: [what the previous attempt did wrong, max 15 words]\n"
+        "APPROACH: [concrete alternative strategy to try, max 15 words]\n\n"
         "Rules:\n"
-        "- Maximum 80 words total\n"
-        "- No bullet points, no markdown, no preamble\n"
-        "- Do not reference 'previous attempt' or 'retry' — write as if this is the first run\n"
-        "- Be specific: name the page, section, or pattern to use or avoid\n"
-        "Return ONLY the 2-sentence goal."
+        "- Use exactly these three labels in this order\n"
+        "- No preamble, no markdown, no extra lines\n"
+        "- Be specific: name the page, section, or pattern\n"
+        "Return JSON only: {\"goal\": \"OBJECTIVE: ...\\nAVOID: ...\\nAPPROACH: ...\"}"
     )
     try:
-        msg = client.messages.create(
+        out = parse_structured(
+            client,
             model=MODEL,
-            max_tokens=150,
+            max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
+            response_model=CompressedGoal,
         )
-        raw = msg.content[0].text.strip()
-        return raw if raw else fallback
+        text = out.goal.strip()
+        return text if text else fallback
     except Exception:
         return fallback

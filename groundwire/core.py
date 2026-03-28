@@ -10,6 +10,8 @@ Internal (frozen after Phase 1 Step 1.3 — do not change without review):
 """
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -83,6 +85,8 @@ def run(
     guardrails: Optional[GuardrailStack] = None,
     _score_curve: Optional[list] = None,
     _depth: int = 0,
+    _run_id: Optional[str] = None,
+    _spans: Optional[list] = None,
 ) -> list[dict]:
     """
     Memory recall → TinyFish stream with live validation (Phase 2) → memory write → log → consolidate.
@@ -93,7 +97,20 @@ def run(
 
     domain = urlparse(url).netloc
     score_curve: list = _score_curve if _score_curve is not None else []
+    run_id = _run_id or str(uuid.uuid4())
+    spans: list = _spans if _spans is not None else []
+    if _depth == 0:
+        spans.append(
+            {
+                "name": "run_begin",
+                "ts": time.time(),
+                "run_id": run_id,
+                "domain": domain,
+                "url": url,
+            }
+        )
     drift_streak = 0
+    visited_urls: dict[str, int] = {}
 
     briefing = recall(domain)
     if briefing:
@@ -132,6 +149,14 @@ def run(
 
         events.append(event)
 
+        # Semantic loop detection: flag URLs visited more than twice.
+        event_url = event.get("url")
+        if event_url:
+            visited_urls[event_url] = visited_urls.get(event_url, 0) + 1
+            if visited_urls[event_url] > 2:
+                print(f"[validator] ⚠  Semantic loop: '{event_url}' visited {visited_urls[event_url]}x")
+                drift_streak += 1
+
         if validate_every > 0 and len(events) % validate_every == 0:
             det = detect_deterministic_signals(events)
             if det["loop"]:
@@ -161,9 +186,18 @@ def run(
 
                 if drift_streak >= DRIFT_STREAK_REQUIRED and _depth < MAX_REPLANS:
                     print("[validator] ✗  Drift confirmed — generating Reflexion critique")
-                    critique = generate_critique(goal, events, check)
+                    critique = generate_critique(goal, events, check, domain)
                     print(f"[validator] Critique: {critique}")
                     score_curve.append("REPLAN")
+                    spans.append(
+                        {
+                            "name": "replan",
+                            "ts": time.time(),
+                            "depth": _depth,
+                            "step": len(events),
+                            "progress_rate": check.get("progress_rate"),
+                        }
+                    )
 
                     quirks = extract_quirks(events, domain)
                     if quirks:
@@ -181,6 +215,8 @@ def run(
                         guardrails,
                         _score_curve=score_curve,
                         _depth=_depth + 1,
+                        _run_id=run_id,
+                        _spans=spans,
                     )
 
                 if drift_streak >= DRIFT_STREAK_REQUIRED and _depth >= MAX_REPLANS:
@@ -210,11 +246,21 @@ def run(
 
     print(f"\n📊 Score curve: {score_curve}")
 
+    spans.append(
+        {
+            "name": "run_complete",
+            "ts": time.time(),
+            "event_count": len(events),
+            "replan_count": score_curve.count("REPLAN"),
+        }
+    )
     events.append(
         {
             "type": "groundwire_meta",
+            "run_id": run_id,
             "score_curve": score_curve,
             "replan_count": score_curve.count("REPLAN"),
+            "spans": spans,
         }
     )
 

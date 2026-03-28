@@ -5,7 +5,7 @@ Groundwire site memory — three-layer knowledge system per domain.
 Storage: .groundwire_memory/<domain>.json
 Schema:
   {
-    "quirks":           [{"text": str, "confidence": int, "last_seen": float}],
+    "quirks":           [{"text": str, "confidence": float, "last_seen": float}],
     "runs":             [{"id": str, "goal": str, "timestamp": float,
                           "step_count": int, "success": bool}],
     "semantic_profile": str,
@@ -14,13 +14,21 @@ Schema:
   }
 
 Public interface:
-    recall, write, extract_quirks, log_run, consolidate
+    recall, write, extract_quirks, log_run, consolidate, atomic_write_json
 """
+from __future__ import annotations
+
 import json
+import os
+import re
+import tempfile
 import time
 from pathlib import Path
 
-import anthropic as _anthropic
+import anthropic
+
+from llm_utils import parse_structured
+from schemas import QuirksList, SemanticProfile
 
 MEMORY_DIR = Path(".groundwire_memory")
 MEMORY_DIR.mkdir(exist_ok=True)
@@ -28,8 +36,37 @@ MEMORY_DIR.mkdir(exist_ok=True)
 # Semantic consolidation every N runs (low threshold for demo visibility).
 CONSOLIDATE_EVERY = 3
 
-# Plan Step 2.2 / 2.3: exact model string from phrase1-actual.md
-_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+_ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# Confidence decay rate: 5% per day of not being seen.
+_DECAY_RATE = 0.95
+_SECONDS_PER_DAY = 86400.0
+
+_PII_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|"
+    r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+)
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Persist JSON via temp file + os.replace (atomic on POSIX)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".tmp",
+        prefix=path.name + ".",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _domain_path(domain: str) -> Path:
@@ -52,6 +89,10 @@ def _empty_domain_data() -> dict:
     }
 
 
+def _filter_pii_quirks(quirks: list[str]) -> list[str]:
+    return [q for q in quirks if q and not _PII_RE.search(q)]
+
+
 def recall(domain: str) -> str:
     """
     Return a stratified plain-English briefing for this domain.
@@ -65,7 +106,7 @@ def recall(domain: str) -> str:
         return ""
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return ""
 
@@ -102,17 +143,18 @@ def recall(domain: str) -> str:
 def write(domain: str, new_quirks: list[str]) -> None:
     """
     Upsert new_quirks into the confidence map for this domain.
-    Found → increment confidence + update last_seen.
-    Not found → insert with confidence=1.
+    Re-seen → time-decay prior confidence then +1; new → insert with confidence=1.
+    Quirks matching email/phone patterns are dropped before persist.
     Does NOT increment run_count — that is owned by log_run().
     """
+    new_quirks = _filter_pii_quirks(list(new_quirks))
     if not new_quirks:
         return
 
     path = _domain_path(domain)
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             data = _empty_domain_data()
     else:
@@ -128,15 +170,27 @@ def write(domain: str, new_quirks: list[str]) -> None:
         elif isinstance(q, dict) and "text" in q:
             existing[q["text"]] = q
 
+    # Decay confidence of quirks not seen in this write batch.
+    new_quirks_set = set(new_quirks)
+    for text, q in existing.items():
+        if text not in new_quirks_set:
+            days = (now - q.get("last_seen", now)) / _SECONDS_PER_DAY
+            if days > 0:
+                q["confidence"] = max(0.1, float(q.get("confidence", 1.0)) * (_DECAY_RATE**days))
+
     for text in new_quirks:
         if text in existing:
-            existing[text]["confidence"] = existing[text].get("confidence", 1) + 1
+            prev = float(existing[text].get("confidence", 1.0))
+            last_seen = float(existing[text].get("last_seen", now))
+            days_since = (now - last_seen) / _SECONDS_PER_DAY
+            decayed = prev * (_DECAY_RATE**days_since) + 1.0
+            existing[text]["confidence"] = max(0.1, decayed)
             existing[text]["last_seen"] = now
         else:
-            existing[text] = {"text": text, "confidence": 1, "last_seen": now}
+            existing[text] = {"text": text, "confidence": 1.0, "last_seen": now}
 
     data["quirks"] = list(existing.values())
-    path.write_text(json.dumps(data, indent=2))
+    atomic_write_json(path, data)
 
 
 def extract_quirks(events: list[dict], domain: str) -> list[str]:
@@ -147,7 +201,7 @@ def extract_quirks(events: list[dict], domain: str) -> list[str]:
     if not events:
         return []
 
-    client = _anthropic.Anthropic()
+    client = anthropic.Anthropic()
     event_sample = json.dumps(events[:20], indent=2)
 
     prompt = (
@@ -159,22 +213,22 @@ def extract_quirks(events: list[dict], domain: str) -> list[str]:
         "- Anti-bot pauses or CAPTCHAs\n"
         "- Unusual pagination patterns\n"
         "- Redirect chains\n\n"
-        "Return ONLY a JSON array of short strings. No preamble. No markdown. No explanation.\n"
-        "If no quirks are detectable, return [].\n"
-        'Example: ["Cookie consent modal on first load", '
-        '"Job listings require scroll to trigger lazy load"]\n\n'
+        "Return a JSON object with a single key \"quirks\" whose value is an array of short strings.\n"
+        "No preamble. No markdown. If none, use {\"quirks\": []}.\n"
+        'Example: {"quirks": ["Cookie consent modal on first load", '
+        '"Job listings require scroll to trigger lazy load"]}\n\n'
         f"Events:\n{event_sample}"
     )
 
     try:
-        msg = client.messages.create(
+        out = parse_structured(
+            client,
             model=_ANTHROPIC_MODEL,
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
+            response_model=QuirksList,
         )
-        raw = msg.content[0].text.strip()
-        parsed = json.loads(raw)
-        return [q for q in parsed if isinstance(q, str)]
+        return [q for q in out.quirks if isinstance(q, str)]
     except Exception:
         return []
 
@@ -187,7 +241,7 @@ def log_run(domain: str, goal: str, events: list[dict], success: bool = True) ->
     path = _domain_path(domain)
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             data = _empty_domain_data()
     else:
@@ -206,7 +260,7 @@ def log_run(domain: str, goal: str, events: list[dict], success: bool = True) ->
     data["runs"] = runs
     data["run_count"] = len(runs)
 
-    path.write_text(json.dumps(data, indent=2))
+    atomic_write_json(path, data)
 
 
 def consolidate(domain: str) -> bool:
@@ -219,7 +273,7 @@ def consolidate(domain: str) -> bool:
         return False
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return False
 
@@ -231,7 +285,7 @@ def consolidate(domain: str) -> bool:
     if not runs:
         return False
 
-    client = _anthropic.Anthropic()
+    client = anthropic.Anthropic()
     recent_runs = runs[-20:]
     runs_summary = json.dumps(
         [
@@ -257,19 +311,20 @@ def consolidate(domain: str) -> bool:
         f"Top known quirks (by confirmation count):\n{quirks_summary}\n\n"
         "Write ONE sentence (max 40 words) strategic profile of this site from a web agent's perspective.\n"
         "Focus on: reliability, common failure points, navigation patterns, which goal types succeed vs struggle.\n"
-        "Return ONLY the sentence. No preamble. No markdown. No trailing punctuation beyond a period."
+        "Return ONLY JSON: {\"profile\": \"<your sentence ending with a period>\"}"
     )
 
     try:
-        msg = client.messages.create(
+        out = parse_structured(
+            client,
             model=_ANTHROPIC_MODEL,
-            max_tokens=100,
+            max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
+            response_model=SemanticProfile,
         )
-        profile = msg.content[0].text.strip()
-        data["semantic_profile"] = profile
+        data["semantic_profile"] = out.profile.strip()
         data["last_consolidated"] = time.time()
-        path.write_text(json.dumps(data, indent=2))
+        atomic_write_json(path, data)
         return True
     except Exception:
         return False
