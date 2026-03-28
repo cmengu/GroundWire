@@ -50,8 +50,16 @@ _SECONDS_PER_DAY = 86400.0
 # Built from PIIScrubber._PATTERNS (single source of truth in guardrails.py).
 _WRITE_PII_RE = re.compile("|".join(_PIIScrubberGuard._PATTERNS.values()))
 
-# Module-level singleton — stateless, thread-safe, one connection pool per process.
-_client = anthropic.Anthropic()
+_client: anthropic.Anthropic | None = None
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """Lazy singleton — created on first extract_quirks/consolidate call so
+    ANTHROPIC_API_KEY set via GroundWire() constructor is honoured before instantiation."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -235,7 +243,7 @@ def extract_quirks(events: list[dict], domain: str) -> list[str]:
 
     try:
         out = parse_structured(
-            _client,
+            _get_anthropic_client(),
             model=_ANTHROPIC_MODEL,
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
@@ -342,7 +350,7 @@ def consolidate(domain: str) -> bool:
 
         try:
             out = parse_structured(
-                _client,
+                _get_anthropic_client(),
                 model=_ANTHROPIC_MODEL,
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],

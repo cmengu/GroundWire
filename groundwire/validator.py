@@ -22,8 +22,16 @@ from schemas import (
     TrajectoryRubric,
 )
 
-# One client per process — stateless, reuses connection pool across validator calls.
-_client = anthropic.Anthropic()
+_client: anthropic.Anthropic | None = None
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """Lazy singleton — created on first validator call so ANTHROPIC_API_KEY set via
+    GroundWire() constructor is honoured before the client is instantiated."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
 
 MODEL = "claude-sonnet-4-6"
 
@@ -133,7 +141,7 @@ def check_trajectory(goal: str, events_so_far: list[dict], intent: str = "") -> 
 
     try:
         rubric = parse_structured(
-            _client,
+            _get_anthropic_client(),
             model=MODEL,
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
@@ -258,7 +266,7 @@ def infer_intent(events: list[dict], domain: str) -> str:
     )
     try:
         out = parse_structured(
-            _client,
+            _get_anthropic_client(),
             model=MODEL,
             max_tokens=60,
             messages=[{"role": "user", "content": prompt}],
@@ -317,7 +325,7 @@ def generate_critique(goal: str, events: list[dict], check_result: dict, domain:
     )
     try:
         out = parse_structured(
-            _client,
+            _get_anthropic_client(),
             model=MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
@@ -358,7 +366,7 @@ def compress_goal(original_goal: str, briefing: str, critique: str) -> str:
     )
     try:
         out = parse_structured(
-            _client,
+            _get_anthropic_client(),
             model=MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],

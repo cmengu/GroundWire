@@ -39,8 +39,16 @@ from llm_utils import parse_structured
 from memory import atomic_write_json
 from schemas import FaithfulnessScore
 
-# One client per process for the LLM judge — matches validator.py singleton pattern.
-_client = anthropic.Anthropic()
+_client: anthropic.Anthropic | None = None
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """Lazy singleton — created on first _llm_judge call so ANTHROPIC_API_KEY set via
+    GroundWire() constructor is honoured before the client is instantiated."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
 
 EVALS_DIR = Path(".groundwire_evals")
 EVALS_DIR.mkdir(exist_ok=True)
@@ -294,7 +302,7 @@ class TrajectoryScorer:
             # Use parse_structured (retry + schema validation) — same pattern as every
             # other LLM call in the codebase. FaithfulnessScore enforces ge=0 le=1.
             result = parse_structured(
-                _client,
+                _get_anthropic_client(),
                 model="claude-sonnet-4-6",
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],

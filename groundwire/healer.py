@@ -37,7 +37,17 @@ _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
 load_dotenv(_here.parent / ".env")
 
-_claude = anthropic.Anthropic()
+_claude: anthropic.Anthropic | None = None
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """Lazy singleton — created on first API call so ANTHROPIC_API_KEY set via
+    GroundWire() constructor reaches this client before it is instantiated."""
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic()
+    return _claude
+
 
 # TinyFish sync endpoint — returns a single JSON response (no SSE streaming).
 TINYFISH_SYNC_URL = "https://agent.tinyfish.ai/v1/automation/run"
@@ -51,7 +61,7 @@ class SelfHealer:
     Hypothesis → Sandbox (real TinyFish run) → Commit flow.
 
     Stateless: no instance variables modified between calls.
-    One shared anthropic.Anthropic client is reused via module-level _claude.
+    Anthropic client is created lazily on first API call via _get_anthropic_client().
     """
 
     def on_deviation_detected(
@@ -138,7 +148,7 @@ class SelfHealer:
         )
         try:
             result = parse_structured(
-                _claude,
+                _get_anthropic_client(),
                 model=MODEL,
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],

@@ -37,7 +37,17 @@ _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
 load_dotenv(_here.parent / ".env")
 
-_claude = anthropic.Anthropic()
+_claude: anthropic.Anthropic | None = None
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """Lazy singleton — created on first classify_block() call so ANTHROPIC_API_KEY
+    set via GroundWire() constructor is honoured before the client is instantiated."""
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic()
+    return _claude
+
 
 TINYFISH_SSE_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 MODEL = "claude-haiku-4-5"
@@ -73,8 +83,8 @@ class AdversarialHardener:
     """
 
     def __init__(self, anthropic_client: Optional[anthropic.Anthropic] = None):
-        # Allow injection for testing; fall back to module-level client.
-        self._claude = anthropic_client or _claude
+        # Store injected client for testing; None means use lazy getter at call time.
+        self._anthropic_client = anthropic_client
 
     def is_blocked(self, events: list[dict]) -> bool:
         """
@@ -134,7 +144,7 @@ class AdversarialHardener:
         )
         try:
             return parse_structured(
-                self._claude,
+                self._anthropic_client or _get_anthropic_client(),
                 model=MODEL,
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
