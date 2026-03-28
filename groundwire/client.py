@@ -33,6 +33,8 @@ import requests
 from dotenv import load_dotenv
 
 from guardrails import GuardrailStack, _noop_stack
+from hardener import AdversarialHardener
+from healer import SelfHealer
 from memory import consolidate, extract_quirks, log_run, recall, write
 from openai_validator import DUAL_VALIDATE_THRESHOLD, dual_validate
 from shared_memory import get_shared_briefing, promote_if_ready, record_episode
@@ -55,6 +57,11 @@ MAX_REPLANS = 1
 
 # Local confidence needed before Supabase promotion (≈2+ sightings on this machine).
 _SHARED_PROMOTE_THRESHOLD = 1.5
+
+# Module-level singletons — stateless; shared across all GroundWire.run() calls.
+# Created once at import time to reuse the Anthropic HTTP connection pool.
+_healer = SelfHealer()
+_hardener = AdversarialHardener()
 
 
 def _infer_run_success(events: list[dict]) -> bool:
@@ -131,6 +138,11 @@ class _RunState:
     llm_call_count: int = 0
     should_replan: bool = False
     replan_goal: str = ""
+    # Memento checkpoint: saved at every validate_every gate.
+    # On replan, completed-step count is injected into compress_goal briefing
+    # so the agent continues from where it left off rather than restarting from page 1.
+    checkpoint: dict = field(default_factory=dict)
+    captcha_detected: bool = False
 
 
 class GroundWire:
@@ -271,8 +283,41 @@ class GroundWire:
             state.events.append(event)
             self._on_progress_hook(event, state)
 
+            # CAPTCHA flag set inside hook — break loop so run() can close resp
+            # and return the human-review meta event.
+            if state.captcha_detected:
+                break
+
             if state.should_replan:
                 break
+
+        # CAPTCHA early return: write partial memory, close connection, return.
+        if state.captcha_detected:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if memory:
+                quirks = extract_quirks(state.events, domain)
+                if quirks:
+                    write(domain, quirks)
+                log_run(domain, goal, state.events, success=False, is_trial=_is_trial)
+            state.events.append({
+                "type": "groundwire_meta",
+                "captcha_detected": True,
+                "action_required": "human_review",
+                "run_id": run_id,
+                "step": len(state.events),
+                "score_curve": state.score_curve,
+                "replan_count": state.score_curve.count("REPLAN"),
+                "llm_call_count": state.llm_call_count,
+                "spans": spans,
+            })
+            result_str = json.dumps(state.events) if state.events else ""
+            scrubbed = stack.post_run(result_str, state.events)
+            if scrubbed != result_str:
+                print("[guardrail] Output scrubbed by post_run rules")
+            return state.events
 
         # Handle replan
         if state.should_replan and _depth < MAX_REPLANS:
@@ -298,6 +343,28 @@ class GroundWire:
             )
             print(f"[validator] Replanning (attempt {_depth + 1}/{MAX_REPLANS})\n")
 
+            # SelfHealer fires before replan to generate a site-behaviour hypothesis.
+            # If the sandbox run confirms it, the confirmed fix is prepended to
+            # state.replan_goal so the next run starts with a verified context.
+            print(f"[healer] Firing hypothesis sandbox for {domain}...")
+            _trajectory_so_far = [
+                str(e.get("purpose") or e.get("action") or e.get("type") or "")
+                for e in state.events[-20:]
+            ]
+            _heal_result = _healer.on_deviation_detected(
+                domain=domain,
+                goal=goal,
+                trajectory_so_far=_trajectory_so_far,
+                deviation_step="drift confirmed",
+            )
+            if _heal_result.get("healed"):
+                _confirmed = _heal_result["hypothesis"]
+                _prefix = f"CONFIRMED FIX: {_confirmed.get('suggested_goal_prefix', '')}\n\n"
+                print(f"[healer] ✓ Confirmed: {_confirmed.get('quirk', '')}")
+                state.replan_goal = _prefix + state.replan_goal
+            else:
+                print("[healer] Hypothesis unconfirmed — replanning with existing context")
+
             return self.run(
                 url,
                 state.replan_goal,
@@ -321,6 +388,29 @@ class GroundWire:
             )
 
         print(f"[core] Run complete — {len(state.events)} events received")
+
+        # AdversarialHardener post-stream check — zero-LLM keyword scan.
+        # Fires only when block signals are detected; no-op on clean runs.
+        # If auto-recovered, state.events is replaced with retry events so the
+        # memory write below records the successful trajectory.
+        if _hardener.is_blocked(state.events):
+            print(f"[hardener] 🛡  Block detected — attempting auto-harden and retry for {domain}")
+            _harden_result = _hardener.auto_harden_and_retry(
+                domain=domain,
+                url=url,
+                goal=goal,
+                run_id=run_id,
+                events=state.events,
+            )
+            if _harden_result.get("auto_recovered"):
+                print(f"[hardener] ✓ Auto-recovered from {_harden_result.get('block_type')} block")
+                retry_evts = _harden_result.get("retry_events", [])
+                if retry_evts:
+                    state.events = retry_evts
+            elif _harden_result.get("action_required") == "human_review":
+                print(f"[hardener] 🔒 Hard block ({_harden_result.get('block_type')}) — human review required")
+            else:
+                print("[hardener] ✗ Auto-hardening attempted but could not recover")
 
         if memory:
             quirks = extract_quirks(state.events, domain)
@@ -407,8 +497,24 @@ class GroundWire:
         if len(state.events) % state.validate_every != 0:
             return
 
-        # Deterministic gate — zero LLM calls
+        # Save checkpoint at every validate_every gate (Memento pattern).
+        # On replan, completed-step count is injected into compress_goal briefing.
+        state.checkpoint = {
+            "events_so_far": list(state.events),
+            "step": len(state.events),
+            "briefing": state.briefing,
+            "drift_streak": state.drift_streak,
+        }
+
+        # CAPTCHA escalation: check before loop handling so CAPTCHA stalls route
+        # to human review instead of triggering a replan cycle.
         det = detect_deterministic_signals(state.events)
+        if det.get("captcha_detected"):
+            print(f"[validator] 🔒 CAPTCHA detected — human intervention required: {det.get('reason', '')}")
+            print("[validator]    Open the TinyFish streaming URL to observe and intervene.")
+            state.captcha_detected = True
+            return
+
         if det["loop"]:
             print(f"[validator] ⚡ Loop detected (deterministic): {det['reason']}")
             state.drift_streak += 1
@@ -454,7 +560,17 @@ class GroundWire:
                 print(f"[validator] Critique: {critique}")
 
                 state.llm_call_count += 1
-                replanned = compress_goal(state.goal, state.briefing, critique)
+                # Inject completed-steps context so agent resumes from checkpoint,
+                # not from the beginning of the page navigation.
+                completed_summary = ""
+                if state.checkpoint.get("events_so_far"):
+                    n = len(state.checkpoint["events_so_far"])
+                    completed_summary = (
+                        f"\nCOMPLETED STEPS (do not repeat): {n} steps already taken. "
+                        "Continue from where the previous attempt left off — "
+                        "do not re-navigate to the start page."
+                    )
+                replanned = compress_goal(state.goal, state.briefing + completed_summary, critique)
                 print(f"[validator] Compressed replanned goal: {replanned[:120]}...")
                 state.replan_goal = replanned
                 state.should_replan = True
