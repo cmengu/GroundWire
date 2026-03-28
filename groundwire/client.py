@@ -360,6 +360,7 @@ class GroundWire:
                 goal=goal,
                 trajectory_so_far=_trajectory_so_far,
                 deviation_step="drift confirmed",
+                url=url,
             )
             if _heal_result.get("healed"):
                 _confirmed = _heal_result["hypothesis"]

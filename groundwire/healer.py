@@ -60,6 +60,7 @@ class SelfHealer:
         goal: str,
         trajectory_so_far: list[str],
         deviation_step: str,
+        url: str = "",
     ) -> dict:
         """
         Entry point called by client.py when drift is confirmed.
@@ -88,7 +89,7 @@ class SelfHealer:
                 continue
 
             logging.info("[healer] Hypothesis: %s", hypothesis.quirk)
-            confirmed = self._sandbox_test(api_key, domain, goal, hypothesis)
+            confirmed = self._sandbox_test(api_key, domain, goal, hypothesis, url=url)
 
             if confirmed:
                 # Commit: bump confidence on the matching local quirk (if it exists).
@@ -154,6 +155,7 @@ class SelfHealer:
         domain: str,
         original_goal: str,
         hypothesis: HypothesisResult,
+        url: str = "",
     ) -> bool:
         """
         Fire a TinyFish SYNC run with the hypothesis prefix prepended to the goal.
@@ -164,8 +166,9 @@ class SelfHealer:
         """
         # Build a minimal sandbox goal: hypothesis prefix + original goal.
         sandbox_goal = f"{hypothesis.suggested_goal_prefix}\n\n{original_goal}"
-        # Use the root domain URL for the sandbox (strip path — just need the site).
-        sandbox_url = f"https://{domain}"
+        # Use the original URL so the sandbox tests the actual page, not just the root domain.
+        # Fallback to root domain only when no URL was provided.
+        sandbox_url = url if url else f"https://{domain}"
 
         try:
             resp = requests.post(
