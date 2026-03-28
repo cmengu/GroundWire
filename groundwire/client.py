@@ -155,9 +155,13 @@ class GroundWire:
 
     def __init__(self, tinyfish_api_key: str, anthropic_api_key: str):
         self._tinyfish_api_key = tinyfish_api_key
-        # anthropic_api_key stored for future SDK migration; currently unused here
-        # (validator.py and memory.py use ANTHROPIC_API_KEY from env directly)
         self._anthropic_api_key = anthropic_api_key
+        # Push keys into env so all downstream modules (validator, memory, healer, hardener)
+        # pick them up via os.getenv. setdefault means .env file values always win.
+        if tinyfish_api_key:
+            os.environ.setdefault("TINYFISH_API_KEY", tinyfish_api_key)
+        if anthropic_api_key:
+            os.environ.setdefault("ANTHROPIC_API_KEY", anthropic_api_key)
 
     @classmethod
     def from_env(cls) -> "GroundWire":
