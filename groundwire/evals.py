@@ -28,6 +28,8 @@ import re
 import time
 from pathlib import Path
 
+from guardrails import PIIScrubber as _PIIScrubberRef
+
 import anthropic
 from core import run as _run_agent
 from memory import atomic_write_json
@@ -144,11 +146,7 @@ class SessionRecorder:
         return tags
 
 
-# PII patterns — duplicated intentionally from Phase 4 guardrails (refactor after Phase 4).
-_PII_PATTERNS = {
-    "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-    "phone": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
-}
+_PII_PATTERNS = _PIIScrubberRef._PATTERNS  # single source of truth — guardrails.PIIScrubber
 
 _STEP_BUDGET = 45
 
