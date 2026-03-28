@@ -4,11 +4,13 @@ Groundwire core — Facade over TinyFish.
 
 Public interface:
     run(url, goal, validate_every=..., guardrails=...) -> list[dict]
+    run_naked(url, goal) -> list[dict]  # demo baseline: TinyFish only, no memory/validator
 
 Internal (frozen after Phase 1 Step 1.3 — do not change without review):
     _stream_tinyfish(url, goal) -> list[dict]
 """
 import json
+import logging
 import os
 import time
 import uuid
@@ -46,17 +48,20 @@ def _stream_tinyfish(url: str, goal: str) -> list[dict]:
     Pure HTTP layer. POSTs to TinyFish, collects all SSE events, returns them as a list.
     FROZEN after Step 1.3 — only timeout/SSE handling; always call through run() for live validation.
     """
-    resp = requests.post(
-        TINYFISH_URL,
-        headers={
-            "X-API-Key": os.getenv("TINYFISH_API_KEY"),
-            "Content-Type": "application/json",
-        },
-        json={"url": url, "goal": goal},
-        stream=True,
-        timeout=180,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            TINYFISH_URL,
+            headers={
+                "X-API-Key": os.getenv("TINYFISH_API_KEY"),
+                "Content-Type": "application/json",
+            },
+            json={"url": url, "goal": goal},
+            stream=True,
+            timeout=180,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"TinyFish request failed: {e}") from e
 
     events = []
     for raw_line in resp.iter_lines():
@@ -78,6 +83,24 @@ def _infer_run_success(events: list[dict]) -> bool:
     return True
 
 
+def run_naked(url: str, goal: str) -> list[dict]:
+    """
+    Bare TinyFish call — no memory recall, no validator, no guardrails, no memory write.
+    Used by demo.py for the cold-start baseline.
+    """
+    domain = urlparse(url).netloc
+    print("[naked] Cold start — no memory, no validator, no guardrails")
+    print(f"[naked] Domain: {domain}")
+    try:
+        events = _stream_tinyfish(url, goal)
+    except Exception as exc:
+        print(f"[naked] TinyFish call failed: {exc}")
+        events = []
+    real_count = len([e for e in events if e.get("type") != "groundwire_meta"])
+    print(f"[naked] Run complete — {real_count} real events received")
+    return events
+
+
 def run(
     url: str,
     goal: str,
@@ -87,6 +110,7 @@ def run(
     _depth: int = 0,
     _run_id: Optional[str] = None,
     _spans: Optional[list] = None,
+    _llm_call_count: int = 0,
 ) -> list[dict]:
     """
     Memory recall → TinyFish stream with live validation (Phase 2) → memory write → log → consolidate.
@@ -122,21 +146,28 @@ def run(
         enriched_goal = goal
 
     # Live stream (duplicated from _stream_tinyfish pattern — _stream_tinyfish body unchanged)
-    resp = requests.post(
-        TINYFISH_URL,
-        headers={
-            "X-API-Key": os.getenv("TINYFISH_API_KEY"),
-            "Content-Type": "application/json",
-        },
-        json={"url": url, "goal": enriched_goal},
-        stream=True,
-        timeout=180,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            TINYFISH_URL,
+            headers={
+                "X-API-Key": os.getenv("TINYFISH_API_KEY"),
+                "Content-Type": "application/json",
+            },
+            json={"url": url, "goal": enriched_goal},
+            stream=True,
+            timeout=180,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"TinyFish request failed: {e}") from e
 
     events: list[dict] = []
+    _stream_deadline = time.time() + 300  # 5-minute hard cap on stream duration
 
     for raw_line in resp.iter_lines():
+        if time.time() > _stream_deadline:
+            logging.warning("[core] Stream deadline (300s) exceeded — stopping stream")
+            break
         if not raw_line:
             continue
         line = raw_line.decode("utf-8")
@@ -165,10 +196,12 @@ def run(
             if det["irreversible"]:
                 print(f"[validator] ⚠  Irreversible action detected: {det['reason']}")
 
+            _llm_call_count += 1
             intent = infer_intent(events, domain)
             if intent:
                 print(f"[validator] Intent: {intent}")
 
+            _llm_call_count += 1
             check = check_trajectory(goal, events)
             score_curve.append(check["progress_rate"])
             print(
@@ -186,6 +219,7 @@ def run(
 
                 if drift_streak >= DRIFT_STREAK_REQUIRED and _depth < MAX_REPLANS:
                     print("[validator] ✗  Drift confirmed — generating Reflexion critique")
+                    _llm_call_count += 2  # generate_critique internally calls infer_intent
                     critique = generate_critique(goal, events, check, domain)
                     print(f"[validator] Critique: {critique}")
                     score_curve.append("REPLAN")
@@ -199,12 +233,15 @@ def run(
                         }
                     )
 
+                    _llm_call_count += 1
                     quirks = extract_quirks(events, domain)
                     if quirks:
                         write(domain, quirks)
                     log_run(domain, goal, events, success=False)
+                    _llm_call_count += 1
                     consolidate(domain)
 
+                    _llm_call_count += 1
                     replanned_goal = compress_goal(goal, briefing or "", critique)
                     print(f"[validator] Compressed replanned goal: {replanned_goal[:120]}...")
                     print(f"[validator] Replanning (attempt {_depth + 1}/{MAX_REPLANS})\n")
@@ -217,6 +254,7 @@ def run(
                         _depth=_depth + 1,
                         _run_id=run_id,
                         _spans=spans,
+                        _llm_call_count=_llm_call_count,
                     )
 
                 if drift_streak >= DRIFT_STREAK_REQUIRED and _depth >= MAX_REPLANS:
@@ -231,6 +269,7 @@ def run(
 
     print(f"[core] Run complete — {len(events)} events received")
 
+    _llm_call_count += 1
     quirks = extract_quirks(events, domain)
     if quirks:
         write(domain, quirks)
@@ -242,6 +281,7 @@ def run(
     print("[memory] Run logged")
 
     if consolidate(domain):
+        _llm_call_count += 1
         print(f"[memory] ✦ Semantic profile updated for {domain}")
 
     print(f"\n📊 Score curve: {score_curve}")
@@ -260,6 +300,7 @@ def run(
             "run_id": run_id,
             "score_curve": score_curve,
             "replan_count": score_curve.count("REPLAN"),
+            "llm_call_count": _llm_call_count,
             "spans": spans,
         }
     )
