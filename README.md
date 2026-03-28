@@ -6,7 +6,7 @@
 
 ---
 
-## The 60-second pitch
+## What this Project is About
 
 **Web agents fail silently in production. Here's how:**
 
