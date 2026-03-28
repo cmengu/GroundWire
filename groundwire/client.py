@@ -251,7 +251,7 @@ class GroundWire:
                     "X-API-Key": self._tinyfish_api_key,
                     "Content-Type": "application/json",
                 },
-                json={"url": url, "goal": enriched_goal},
+                json={"url": url, "goal": enriched_goal, **tinyfish_kwargs},
                 stream=True,
                 timeout=180,
             )
