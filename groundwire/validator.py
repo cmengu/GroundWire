@@ -28,10 +28,12 @@ def check_trajectory(goal: str, events: list[dict]) -> dict:
     """
     steps = []
     for e in events[-10:]:
+        # TinyFish PROGRESS events carry human-readable intent in "purpose" (Phase 0 curl).
         step_str = (
-            e.get("action")
-            or e.get("type")
+            e.get("purpose")
+            or e.get("action")
             or e.get("description")
+            or e.get("type")
             or str(e)[:120]
         )
         steps.append(step_str)
