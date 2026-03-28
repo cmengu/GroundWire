@@ -43,21 +43,21 @@ flowchart TD
         subgraph TF["  TinyFish SSE Stream — every PROGRESS event  "]
             direction TB
             V["③ Trajectory Validation
-            Claude Sonnet 4-axis rubric
+            GPT-4o 4-axis rubric
             goal_alignment · action_efficiency · risk_signal
             + GPT-4o dual gate when score < 0.70"]
             V -->|CAPTCHA loop detected| CA["④ CAPTCHA Escalation
             human-in-loop · resp.close()
             partial memory write · returns immediately"]
             V -->|drift streak confirmed| SH["⑤ Self-Healing
-            Claude Haiku hypothesis
+            GPT-4o mini hypothesis
             → TinyFish sync sandbox
             → commit + replan with confirmed fix"]
         end
 
         TF --> AH["⑥ Adversarial Hardening
         zero-LLM keyword scan
-        Claude Haiku block classification
+        GPT-4o mini block classification
         stealth profile + proxy auto-retry"]
         AH --> MW["⑦ Memory Write + Cross-Agent Sync
         extract_quirks → confidence write
@@ -77,7 +77,7 @@ flowchart TD
 
 Before firing TinyFish, GroundWire pulls two briefings and merges them into the goal:
 
-- **Local memory** (`memory.py`) — per-domain JSON: confidence-weighted quirks, episodic run history, Claude-synthesized semantic profile (every 3 real runs)
+- **Local memory** (`memory.py`) — per-domain JSON: confidence-weighted quirks, episodic run history, GPT-4o-synthesized semantic profile (every 3 real runs)
 - **Shared memory** (`shared_memory.py`) — Supabase: quirks confirmed by 2+ agents cross-machine, promoted once local confidence crosses `1.5×`
 
 ```
@@ -123,11 +123,11 @@ Every 5 PROGRESS events, GroundWire scores the trajectory on four axes:
 
 When `progress_rate < 0.60` on 2 consecutive checkpoints: **drift confirmed → replan**.
 
-**Dual-model gate:** when Claude Sonnet's score drops below `0.70`, GPT-4o scores the same trajectory independently. The more conservative score wins.
+**Dual-model gate:** when GPT-4o's primary score drops below `0.70`, a second GPT-4o call scores the same trajectory independently as a cross-check. The more conservative score wins.
 
 ```
 [validator] step  10 | progress=0.64 | align=0.71 | eff=0.55 | risk=0.22
-[openai]  GPT-4o: 0.61 | Claude: 0.64 | Using conservative: 0.61
+[openai]  GPT-4o check: 0.61 | Primary: 0.64 | Using conservative: 0.61
 [validator] ✗  Drift confirmed — generating Reflexion critique
 ```
 
@@ -154,7 +154,7 @@ The SSE connection closes immediately. Partial memory is written. The caller get
 
 When drift is confirmed, before replanning, GroundWire runs a three-stage cycle using `healer.py`:
 
-1. **Hypothesise** (Claude Haiku) — generates a site-behaviour explanation for the stall  
+1. **Hypothesise** (GPT-4o mini) — generates a site-behaviour explanation for the stall  
    *"Cookie modal blocks the pricing section on first visit."*
 
 2. **Sandbox** — fires a real TinyFish sync run (`POST /v1/automation/run`) with the hypothesis prefix injected into the goal. 90s timeout.
@@ -174,11 +174,11 @@ Max 2 hypothesis attempts per drift event. Gracefully returns `{"healed": False}
 ---
 
 ### ⑥ Adversarial Hardening
-*Post-stream block detection, Claude Haiku classification, and escalated auto-retry.*
+*Post-stream block detection, GPT-4o mini classification, and escalated auto-retry.*
 
 After the SSE stream completes, `hardener.py` runs a zero-LLM keyword scan on the full event list and COMPLETE payload. If blocked:
 
-1. **Classify** (Claude Haiku) → `block_type`: `cloudflare | datadome | captcha | geo_block | rate_limit | login_wall | unknown`
+1. **Classify** (GPT-4o mini) → `block_type`: `cloudflare | datadome | captcha | geo_block | rate_limit | login_wall | unknown`
 2. **Decide**: `escalate_to_human: true` for hard blocks → human review. False → auto-retry.
 3. **Retry** → re-fires TinyFish with `browser_profile: "stealth"` + optional `proxy_config: {country: "US"}` residential proxy
 4. **Replace** → if retry succeeds, `state.events` is replaced with the clean retry events before memory write
@@ -196,9 +196,9 @@ After the SSE stream completes, `hardener.py` runs a zero-LLM keyword scan on th
 
 Post-stream (using clean events — retry events if hardener recovered):
 
-1. Claude Haiku extracts site quirks from the event trajectory → confidence-weighted upsert to local JSON
+1. GPT-4o mini extracts site quirks from the event trajectory → confidence-weighted upsert to local JSON
 2. `log_run()` appends the episodic record
-3. Every 3rd real run: `consolidate()` synthesizes a one-sentence Claude strategic profile
+3. Every 3rd real run: `consolidate()` synthesizes a one-sentence GPT-4o strategic profile
 4. `_sync_quirks_to_shared()` — promotes quirks where local confidence ≥ 1.5× via Supabase RPC `upsert_quirk` + logs `run_episodes`
 
 Any new agent tackling the same domain gets step ① pre-briefed with this knowledge.
@@ -210,7 +210,7 @@ Any new agent tackling the same domain gets step ① pre-briefed with this knowl
 `evals.py` separates recording from scoring:
 
 - **`SessionRecorder`** — write-only, records golden runs to `.groundwire_evals/<session>.json`
-- **`TrajectoryScorer`** — hard gates first (PII, step budget), then Claude Haiku LLM judge, then `faithfulness` score (0–1)
+- **`TrajectoryScorer`** — hard gates first (PII, step budget), then GPT-4o mini LLM judge, then `faithfulness` score (0–1)
 - **`run_k_trials(k=3)`** — runs N trials, computes `pass@1`, `pass@3`, pass rate, mean faithfulness
 
 ```
@@ -221,7 +221,7 @@ Any new agent tackling the same domain gets step ① pre-briefed with this knowl
 
 ---
 
-## Benchmarks (dry-run, live Claude)
+## Benchmarks (dry-run, live OpenAI)
 
 | | Naked TinyFish | With GroundWire |
 |---|---|---|
@@ -247,7 +247,7 @@ groundwire/
 ├── validator.py        # Trajectory rubric scoring · CAPTCHA/loop detection · Reflexion critique
 │                       # DRIFT_THRESHOLD=0.60 · DRIFT_STREAK_REQUIRED=2 · CAPTCHA_SIGNALS
 ├── healer.py           # SelfHealer: Hypothesis → TinyFish sync sandbox → memory commit
-├── hardener.py         # AdversarialHardener: scan → Claude classify → stealth retry → Supabase log
+├── hardener.py         # AdversarialHardener: scan → GPT-4o mini classify → stealth retry → Supabase log
 ├── memory.py           # Per-domain JSON: quirks (confidence) + runs + semantic_profile
 │                       # patch_quirk · record_antibot_event · record_antibot_resolution
 ├── shared_memory.py    # Supabase: get_shared_briefing · promote_if_ready · record_episode
@@ -256,7 +256,7 @@ groundwire/
 ├── guardrails.py       # DomainAllowlist · PIIScrubber · ActionBudget · GuardrailStack
 ├── evals.py            # SessionRecorder · TrajectoryScorer · run_k_trials · pass@k
 ├── openai_validator.py # GPT-4o dual-validation gate (DUAL_VALIDATE_THRESHOLD=0.70)
-├── llm_utils.py        # parse_structured — unified Claude tool-use helper
+├── llm_utils.py        # parse_structured — unified OpenAI structured output helper
 ├── supabase_schema.sql # domain_quirks · run_episodes · antibot_events DDL
 └── demo.py             # Full pitch script: naked → golden → 3 scored trials → scorecard
 ```
@@ -265,9 +265,8 @@ groundwire/
 
 | Model | Used for |
 |---|---|
-| `claude-sonnet-4-6` | Trajectory rubric, intent inference, Reflexion critique, goal compression, faithfulness scoring |
-| `claude-haiku-4-5` | Hypothesis generation, block classification, quirk extraction, consolidation |
-| `gpt-4o` | Dual-validation second opinion (when Claude score < 0.70) |
+| `gpt-4o` | Trajectory rubric, intent inference, Reflexion critique, goal compression, faithfulness scoring, dual-validation cross-check |
+| `gpt-4o-mini` | Hypothesis generation, block classification, quirk extraction, consolidation |
 
 **TinyFish endpoints:**
 
@@ -314,7 +313,7 @@ python demo.py
 ```bash
 python demo.py --skip-naked          # skip naked baseline, run golden + trials
 python demo.py --trials-only         # only run scored trials (needs saved session)
-python demo.py --dry-run             # synthetic events, live Claude scoring
+python demo.py --dry-run             # synthetic events, live OpenAI scoring
 ```
 
 ---
@@ -323,7 +322,7 @@ python demo.py --dry-run             # synthetic events, live Claude scoring
 
 Every feature degrades gracefully when dependencies are absent:
 - No Supabase credentials → shared memory silently no-ops
-- No OpenAI key → dual-validation skipped, Claude score used
+- No OpenAI key → dual-validation skipped, primary score used
 - No TinyFish key → healer sandbox returns `{"healed": False}` immediately
 - Hardener retry with stealth profile fails → original events used for memory write
 
@@ -331,6 +330,6 @@ The system **never crashes** on missing optional dependencies. You get the featu
 
 ---
 
-## Built at TinyFish × Anthropic Hackathon
+## Built at TinyFish × OpenAI Hackathon
 
-Powered by [TinyFish](https://www.tinyfish.ai) web agents API and [Anthropic Claude](https://www.anthropic.com).
+Powered by [TinyFish](https://www.tinyfish.ai) web agents API and [OpenAI](https://www.openai.com).
