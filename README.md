@@ -1,6 +1,21 @@
+<div align="center">
+
 # GroundWire
 
-**Reliability middleware for web agents. One import. Seven features. Zero new infrastructure required.**
+**Reliability middleware for web agents: it sits between your code and TinyFish and catches stalls, drift, blocks, CAPTCHA loops and PII leaks from the live event stream.**
+
+![Terminal recording of python demo.py --dry-run: a naked run (11 steps, no change detected), a GroundWire golden run with validator output and a memory report, then a 3-trial eval scorecard with pass@3 100% and mean faithfulness 0.95](docs/demo.gif)
+
+<sub>`python demo.py --dry-run` from the `groundwire/` folder: no API keys, synthetic agent events (no TinyFish) fed through GroundWire's validator, memory and guardrails. The 0.95 faithfulness scores in this mode are mocked.</sub>
+
+</div>
+
+## Why
+
+Web agents fail silently in production: they loop on a cookie modal, return a Cloudflare challenge page as the "result", retry the same CAPTCHA 50 times, or leak emails and phone numbers in the output.
+GroundWire watches each run as it streams, then self-heals, retries on a stealth profile, escalates CAPTCHAs to a human, and scrubs PII before the result reaches your code.
+
+---
 
 > *"TinyFish gives you the agent. GroundWire gives you the SLA."*
 
