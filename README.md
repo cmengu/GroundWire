@@ -4,9 +4,9 @@
 
 **Reliability middleware for web agents: it sits between your code and TinyFish and catches stalls, drift, blocks, CAPTCHA loops and PII leaks from the live event stream.**
 
-![Terminal recording of python demo.py --dry-run: a naked run (11 steps, no change detected), a GroundWire golden run with validator output and a memory report, then a 3-trial eval scorecard with pass@3 100% and mean faithfulness 0.95](docs/demo.gif)
+![Terminal recording of python demo.py --dry-run piped through grep: GroundWire's deterministic loop check reports 3 identical consecutive actions, then the run completes with 10 events received](docs/demo.gif)
 
-<sub>`python demo.py --dry-run` from the `groundwire/` folder: no API keys, synthetic agent events (no TinyFish) fed through GroundWire's validator, memory and guardrails. The 0.95 faithfulness scores in this mode are mocked.</sub>
+<sub>`python demo.py --dry-run | grep -E 'Loop detected|\[core\]'` from the `groundwire/` folder. The agent events are scripted: no TinyFish and no model calls. The loop check shown is real GroundWire code that needs no model, reacting to those scripted events. The other scores in dry-run mode are hard-coded, so they are not shown.</sub>
 
 </div>
 
