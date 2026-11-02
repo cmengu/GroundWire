@@ -52,42 +52,12 @@ result = gw.run(url="https://amazon.com", goal="Get price of AirPods Pro")
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A([Your Code]):::input --> B
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
+  <img alt="A run moves left to right: allowlist, memory briefing, the TinyFish agent checked every 5 events, block check, learn, PII scrub, result. During the run, drift on 2 checks in a row loops back to test a fix and replan, and a CAPTCHA loop stops the run and hands it to a person." src="docs/how-it-works-light.svg">
+</picture>
 
-    subgraph GW["  GroundWire.run()  "]
-        direction TB
-        B["① Cross-Agent Memory Recall\nlocal JSON + Supabase briefing\ninjected into TinyFish goal"]:::memory
-        B --> C["② Guardrails Pre-Check\nDomainAllowlist · PIIScrubber · ActionBudget\nfails fast — zero API cost on block"]:::guard
-        C --> TF
-
-        subgraph TF["  🔴 TinyFish SSE Stream — every PROGRESS event  "]
-            direction TB
-            V["③ ★ Trajectory Validation\nGPT-4o 4-axis rubric\ngoal_alignment · action_efficiency · risk_signal\n+ dual-model gate when score < 0.70"]:::critical
-            V -->|CAPTCHA loop detected| CA["④ CAPTCHA Escalation\nhuman-in-loop · resp.close()\npartial memory write · returns immediately"]:::captcha
-            V -->|drift streak confirmed| SH["⑤ ★ Self-Healing\nGPT-4o mini hypothesis\n→ TinyFish sync sandbox\n→ commit + replan with confirmed fix"]:::heal
-        end
-
-        TF --> AH["⑥ ★ Adversarial Hardening\nzero-LLM keyword scan\nGPT-4o mini block classification\nstealth profile + proxy auto-retry"]:::harden
-        AH --> MW["⑦ Memory Write + Cross-Agent Sync\nextract_quirks → confidence write\n→ Supabase promotion → run_episodes log"]:::memory
-    end
-
-    MW --> R([Result Events + groundwire_meta]):::output
-    R --> E["Evals · faithfulness · pass@k"]:::eval
-
-    classDef input fill:#6366f1,stroke:#4338ca,color:#fff
-    classDef memory fill:#8b5cf6,stroke:#7c3aed,color:#fff
-    classDef guard fill:#f59e0b,stroke:#d97706,color:#111
-    classDef critical fill:#ef4444,stroke:#991b1b,color:#fff
-    classDef captcha fill:#f97316,stroke:#c2410c,color:#fff
-    classDef heal fill:#10b981,stroke:#065f46,color:#fff
-    classDef harden fill:#3b82f6,stroke:#1d4ed8,color:#fff
-    classDef output fill:#06b6d4,stroke:#0e7490,color:#fff
-    classDef eval fill:#64748b,stroke:#334155,color:#fff
-```
-
-**★ = the three features that prevent silent production failures**
+The allowlist, PII scrub and action budget are opt-in: pass a `GuardrailStack` to turn them on. A run replans at most once.
 
 ---
 
